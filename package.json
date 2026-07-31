@@ -1,0 +1,10 @@
+{
+  "name": "glance-new-tab-for-fnos",
+  "version": "0.8.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "validate": "node scripts/validate-extension.js"
+  }
+}

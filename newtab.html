@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Glance New Tab for fnOS</title>
+    <link rel="stylesheet" href="newtab.css">
+  </head>
+  <body>
+    <main class="card">
+      <div class="mark" aria-hidden="true">G</div>
+      <h1>正在打开主页</h1>
+      <p id="status">正在读取新标签页设置…</p>
+      <div class="spinner" aria-hidden="true"></div>
+      <a id="target-link" hidden>立即打开</a>
+      <button id="open-options" type="button">扩展设置</button>
+    </main>
+    <script type="module" src="newtab.js"></script>
+  </body>
+</html>

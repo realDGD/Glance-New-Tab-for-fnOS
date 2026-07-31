@@ -1,0 +1,82 @@
+{
+  "manifest_version": 3,
+  "name": "Glance New Tab for fnOS",
+  "short_name": "Glance 新标签页",
+  "version": "0.8.0",
+  "description": "将 Glance 设为新标签页，并在 fnOS 会话失效时通过官方页面自动恢复后返回主页。",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://5ddd.com/*",
+    "*://*.5ddd.com/*",
+    "*://fnos.net/*",
+    "*://*.fnos.net/*"
+  ],
+  "optional_host_permissions": [
+    "file:///*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
+  "options_page": "options.html",
+  "action": {
+    "default_title": "Glance 新标签页设置",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://5ddd.com/*",
+        "*://*.5ddd.com/*",
+        "*://fnos.net/*",
+        "*://*.fnos.net/*"
+      ],
+      "js": [
+        "page-probe.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://5ddd.com/*",
+        "*://*.5ddd.com/*",
+        "*://fnos.net/*",
+        "*://*.fnos.net/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://5ddd.com/api/healthz*",
+        "*://*.5ddd.com/api/healthz*",
+        "*://fnos.net/api/healthz*",
+        "*://*.fnos.net/api/healthz*"
+      ],
+      "js": [
+        "frame-probe.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ]
+}

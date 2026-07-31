@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Glance 新标签页设置</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <header class="hero">
+      <div class="hero-inner">
+        <div class="logo" aria-hidden="true">G</div>
+        <div class="hero-copy">
+          <p class="eyebrow">Chrome 扩展</p>
+          <h1>Glance New Tab for fnOS</h1>
+          <p class="subtitle">把 Glance 设为新标签页，并在 fnOS 会话失效时自动通过官方页面恢复。</p>
+        </div>
+        <label class="theme-control">
+          <span>外观</span>
+          <select id="theme-mode">
+            <option value="auto">跟随浏览器</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <main>
+      <section id="setup-notice" class="setup-notice" hidden>
+        <div class="setup-icon" aria-hidden="true">1</div>
+        <div>
+          <strong>首次使用需要填写你的飞牛地址</strong>
+          <p>扩展不再预置任何 NAS 标识。填写下面的主页网址后，可以自动推导根网址和状态检测地址。</p>
+        </div>
+      </section>
+
+      <form id="settings-form">
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>新标签页</h2>
+              <p>功能等同于 Custom New Tab URL：打开新标签页时跳转到指定地址。</p>
+            </div>
+            <label class="switch">
+              <input id="enabled" type="checkbox">
+              <span aria-hidden="true"></span>
+              <b>启用</b>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>主页网址</span>
+            <input id="target-url" type="text" spellcheck="false" autocomplete="off" placeholder="https://你的飞牛ID.5ddd.com/app/glance-homepage/" required>
+            <small>支持 fnOS 原生应用、FN Connect Docker 服务子域、普通 http(s)、本地 file:// 文件和常见 chrome:// 页面。</small>
+          </label>
+          <div id="file-access" class="notice" hidden></div>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>fnOS 登录恢复</h2>
+              <p>不保存账号、密码或 token；只打开 fnOS 官方页面，让现有登录机制恢复会话。</p>
+            </div>
+            <label class="switch">
+              <input id="recovery-enabled" type="checkbox">
+              <span aria-hidden="true"></span>
+              <b>启用</b>
+            </label>
+          </div>
+
+          <div id="recovery-fields">
+            <div class="field-row">
+              <label class="field">
+                <span>fnOS 根网址</span>
+                <input id="root-url" type="url" spellcheck="false" autocomplete="off" placeholder="可留空，保存时自动填写">
+                <small>会话失效时先访问这里，例如 https://你的飞牛ID.5ddd.com/。</small>
+              </label>
+              <label class="field">
+                <span>等待提示时间（秒）</span>
+                <input id="recovery-timeout" type="number" min="15" max="600" step="1">
+                <small>达到此时间只改变提示，不会停止检测。</small>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>登录状态检测网址</span>
+              <input id="health-url" type="url" spellcheck="false" autocomplete="off" placeholder="可留空，保存时自动填写">
+              <small>原生应用自动使用 <code>/__fnos/health</code>；官方 Docker Glance 自动使用 <code>/api/healthz</code>。</small>
+            </label>
+
+            <button id="infer-urls" class="secondary" type="button">根据主页网址自动填写</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>会话保活</h2>
+              <p>fnOS 页面保持打开时，定期在同一站点访问状态检测地址。</p>
+            </div>
+            <label class="switch">
+              <input id="keepalive-enabled" type="checkbox">
+              <span aria-hidden="true"></span>
+              <b>启用</b>
+            </label>
+          </div>
+
+          <label class="field compact">
+            <span>检测间隔（分钟）</span>
+            <input id="keepalive-minutes" type="number" min="1" max="120" step="1">
+            <small>这能延长运行中的会话，但浏览器关闭后仍以 fnOS 自身的 Cookie 规则为准。</small>
+          </label>
+        </section>
+
+        <div class="actions">
+          <button class="primary" type="submit">保存设置</button>
+          <button id="test-recovery" class="secondary" type="button">保存并测试恢复</button>
+          <button id="reset-settings" class="quiet" type="button">恢复默认值</button>
+          <output id="save-status" role="status" aria-live="polite"></output>
+        </div>
+      </form>
+
+      <aside class="privacy-note">
+        <strong>隐私边界</strong>
+        <span>扩展只把非敏感设置保存到 Chrome 同步存储；临时恢复状态会在浏览器会话结束时清除。扩展未申请 Cookie 权限。</span>
+        <a href="PRIVACY.md" target="_blank">查看隐私说明</a>
+      </aside>
+    </main>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
