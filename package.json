@@ -2,6 +2,7 @@
   "name": "glance-new-tab-for-fnos",
   "version": "0.8.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "node --test",

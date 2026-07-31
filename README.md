@@ -195,3 +195,7 @@ npm run validate
 - [fnnas-docs](https://github.com/ckcoding/fnnas-docs)
 
 本项目是独立的社区扩展，与 Glance、飞牛 fnOS 或 FN Connect 官方团队不存在隶属关系。
+
+## 许可证
+
+本扩展采用 [MIT License](LICENSE)。Glance 本身由其原作者以 AGPL-3.0 许可证发布，不包含在本扩展中。

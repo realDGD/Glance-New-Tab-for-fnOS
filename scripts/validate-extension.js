@@ -12,6 +12,7 @@ const packageJson = JSON.parse(await readFile(resolve(root, "package.json"), "ut
 assert.equal(manifest.manifest_version, 3, "必须使用 Manifest V3");
 assert.equal(manifest.name, "Glance New Tab for fnOS", "扩展品牌名称不一致");
 assert.equal(packageJson.name, "glance-new-tab-for-fnos", "软件包名称不一致");
+assert.equal(packageJson.license, "MIT", "软件包必须声明 MIT 许可证");
 assert.equal(manifest.version, packageJson.version, "Manifest 与 package.json 版本不一致");
 assert.equal(manifest.background?.type, "module", "后台脚本必须以 ES module 运行");
 assert.equal(manifest.chrome_url_overrides?.newtab, "newtab.html", "缺少新标签页覆盖");
@@ -30,6 +31,7 @@ for (const permission of manifest.permissions ?? []) {
 }
 
 const referencedFiles = new Set([
+  "LICENSE",
   manifest.background.service_worker,
   manifest.chrome_url_overrides.newtab,
   manifest.options_page,
