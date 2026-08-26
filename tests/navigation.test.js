@@ -315,3 +315,115 @@ test("Scenario 10 (P3): Dynamic content scripts in-memory cache skips redundant 
   assert.equal(apiCalls, 1);
 });
 
+test("P0.1 & P0.6: Synchronous URL mismatch freeze stops in-flight tasks before any async storage resolves", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 201;
+  const gen = manager.begin(tabId);
+  const lanUrl = "http://192.168.1.10:18080/";
+  manager.setExpectedUrl(tabId, gen, lanUrl);
+  manager.setPending(tabId, { phase: "target", targetUrl: lanUrl }, gen);
+
+  const signal = manager.getAbortSignal(tabId, gen);
+
+  // Simulate an in-flight health probe Promise
+  let delayedProbeFinished = false;
+  let simulatedTabUpdateCalled = false;
+
+  const inFlightProbe = new Promise((resolve) => {
+    setTimeout(() => {
+      delayedProbeFinished = true;
+      // Before updating tab, probe checks if generation is still active
+      if (manager.isActive(tabId, gen)) {
+        simulatedTabUpdateCalled = true;
+      }
+      resolve();
+    }, 20);
+  });
+
+  // User immediately navigates to github.com in address bar (tabs.onUpdated synchronously fires)
+  const result = manager.handleUrlChange(tabId, "https://github.com/");
+  assert.equal(result.cancelled, true);
+  assert.equal(result.matched, false);
+
+  // SYNCHRONOUS ASSERTION: The generation MUST be frozen immediately, before inFlightProbe resolves
+  assert.equal(manager.isActive(tabId, gen), false);
+  assert.equal(signal.aborted, true);
+  assert.equal(manager.setExpectedUrl(tabId, gen, "http://192.168.1.10:18080/"), false);
+
+  // Wait for in-flight probe to complete
+  await inFlightProbe;
+  assert.equal(delayedProbeFinished, true);
+  assert.equal(simulatedTabUpdateCalled, false);
+});
+
+test("P0.7: Delayed cleanup from generation N does not cancel or pollute generation N+1", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 202;
+
+  // Generation 1 starts
+  const gen1 = manager.begin(tabId);
+  manager.setExpectedUrl(tabId, gen1, "https://old-target.example.com/");
+  manager.setPending(tabId, { phase: "target", targetUrl: "https://old-target.example.com/" }, gen1);
+
+  // Unexpected URL cancels generation 1
+  const changeResult = manager.handleUrlChange(tabId, "https://github.com/");
+  assert.equal(changeResult.cancelled, true);
+  assert.equal(manager.isActive(tabId, gen1), false);
+
+  // Generation 2 starts on the same tab
+  const gen2 = manager.begin(tabId);
+  assert.equal(gen2, 2);
+  const gen2Url = "https://demo-nas.5ddd.com/app/glance-homepage/";
+  manager.setExpectedUrl(tabId, gen2, gen2Url);
+  manager.setPending(tabId, { phase: "target", targetUrl: gen2Url }, gen2);
+  const signal2 = manager.getAbortSignal(tabId, gen2);
+
+  // Now delayed cleanup from Generation 1 runs: cancel(tabId, "delayed-cleanup", gen1)
+  const cancelResult = manager.cancel(tabId, "delayed-cleanup", gen1);
+  assert.equal(cancelResult, null); // Target generation mismatch, ignored!
+
+  // Assert Generation 2 is completely unaffected
+  assert.equal(manager.isActive(tabId, gen2), true);
+  assert.equal(manager.getGeneration(tabId), 2);
+  assert.equal(signal2.aborted, false);
+  assert.equal(manager.getPending(tabId, gen2)?.targetUrl, gen2Url);
+});
+
+test("P0.3: Multi-phase recovery in-memory pending tracking preserves ownership synchronously", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 203;
+
+  const gen = manager.begin(tabId);
+  const bootstrapPending = {
+    recoveryKind: "docker",
+    phase: "bootstrap",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    targetUrl: "https://service-0.demo-nas.5ddd.com/"
+  };
+  manager.setPending(tabId, bootstrapPending, gen);
+  manager.setExpectedUrl(tabId, gen, bootstrapPending.bootstrapUrl);
+
+  // Phase 1: Bootstrap transit URLs
+  assert.equal(manager.handleUrlChange(tabId, "https://5ddd.com/demo-nas/").matched, true);
+  assert.equal(manager.handleUrlChange(tabId, "https://check.fnos.net/").matched, true);
+  assert.equal(manager.handleUrlChange(tabId, "https://demo-nas.5ddd.com/").matched, true);
+  assert.equal(manager.isActive(tabId, gen), true);
+
+  // Phase 2: Target transition
+  const targetPending = {
+    ...bootstrapPending,
+    phase: "target"
+  };
+  manager.setPending(tabId, targetPending, gen);
+  manager.setExpectedUrl(tabId, gen, targetPending.targetUrl);
+
+  assert.equal(manager.handleUrlChange(tabId, "https://service-0.demo-nas.5ddd.com/").matched, true);
+  assert.equal(manager.isActive(tabId, gen), true);
+
+  // Phase 3: User navigates away to unrelated domain
+  assert.equal(manager.handleUrlChange(tabId, "https://example.org/").cancelled, true);
+  assert.equal(manager.isActive(tabId, gen), false);
+});
+
+

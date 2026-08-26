@@ -14,10 +14,8 @@ function applyTheme(mode) {
 }
 
 async function start() {
-  const currentTab = await chrome.tabs.getCurrent();
   const response = await chrome.runtime.sendMessage({
-    type: "OPEN_NEW_TAB",
-    tabId: currentTab?.id
+    type: "OPEN_NEW_TAB"
   });
 
   if (response?.error) {

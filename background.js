@@ -40,6 +40,8 @@ const tabTransitionQueues = new Map();
 const tabNavigations = new TabNavigationManager();
 const registeredScriptPatterns = new Set();
 
+void restoreLanContentScripts();
+
 function routeKey(targetUrl) {
   return normalizeNavigableUrl(targetUrl);
 }
@@ -202,16 +204,23 @@ function pendingKey(tabId) {
 }
 
 async function getPending(tabId) {
+  const memory = tabNavigations.getPending(tabId);
+  if (memory) {
+    return memory;
+  }
   const key = pendingKey(tabId);
   const result = await chrome.storage.session.get(key);
   return result[key] ?? null;
 }
 
 async function setPending(tabId, pending) {
+  const generation = tabNavigations.getGeneration(tabId);
+  tabNavigations.setPending(tabId, pending, generation);
   await chrome.storage.session.set({ [pendingKey(tabId)]: pending });
 }
 
 async function removePending(tabId) {
+  tabNavigations.setPending(tabId, null);
   await chrome.storage.session.remove(pendingKey(tabId));
 }
 
@@ -219,8 +228,12 @@ function beginNavigation(tabId) {
   return tabNavigations.begin(tabId);
 }
 
-async function cancelNavigation(tabId, reason = "cancelled") {
-  tabNavigations.cancel(tabId, reason);
+async function cancelNavigation(tabId, reason = "cancelled", targetGeneration = null) {
+  const latestGen = tabNavigations.getLatestGeneration(tabId);
+  if (targetGeneration !== null && latestGen !== null && latestGen > targetGeneration) {
+    return;
+  }
+  tabNavigations.cancel(tabId, reason, targetGeneration);
   tabTransitionQueues.delete(tabId);
   await removePending(tabId);
   await removeLanDiscovery(tabId);
@@ -240,7 +253,7 @@ async function navigateOwnedTab(tabId, generation, url, options = {}) {
   try {
     targetUrl = normalizeNavigableUrl(url);
   } catch (error) {
-    await cancelNavigation(tabId, "invalid-url");
+    await cancelNavigation(tabId, "invalid-url", generation);
     return { ok: false, error };
   }
 
@@ -253,7 +266,7 @@ async function navigateOwnedTab(tabId, generation, url, options = {}) {
     return { ok: true, tab: updatedTab };
   } catch (error) {
     if (tabNavigations.isActive(tabId, generation)) {
-      await cancelNavigation(tabId, "tab-update-failed");
+      await cancelNavigation(tabId, "tab-update-failed", generation);
     }
     return { ok: false, error };
   }
@@ -553,7 +566,7 @@ async function tryOpenLearnedLanRoute(tabId, settings, generation) {
     return null;
   }
 
-  await ensureLanContentScripts(pattern);
+  void ensureLanContentScripts(pattern);
 
   if (!tabNavigations.isActive(tabId, generation)) {
     return null;
@@ -668,17 +681,13 @@ async function navigateToTarget(tabId, pending, reason, explicitGeneration = nul
     lastAttemptAt: Date.now()
   };
   await setPending(tabId, updated);
-  if (generation !== null) {
-    await navigateOwnedTab(tabId, generation, updated.targetUrl);
-  } else {
-    await chrome.tabs.update(tabId, { url: updated.targetUrl });
-  }
+  await navigateOwnedTab(tabId, generation, updated.targetUrl);
   return { action: "navigating" };
 }
 
 async function handleAuthFailure(tabId, reason = "authentication-failed") {
-  const generation = tabNavigations.getGeneration(tabId);
-  if (generation !== null && !tabNavigations.isActive(tabId, generation)) {
+  const generation = tabNavigations.getGeneration(tabId) || beginNavigation(tabId);
+  if (!tabNavigations.isActive(tabId, generation)) {
     return { action: "ignored" };
   }
   const pending = await getPending(tabId);
@@ -696,7 +705,7 @@ async function handleAuthFailure(tabId, reason = "authentication-failed") {
       lastError: reason,
       rootEnteredAt: Date.now()
     });
-    await cancelNavigation(tabId, "lan-target-auth-failed");
+    await cancelNavigation(tabId, "lan-target-auth-failed", generation);
     try {
       await navigateOwnedTab(helperTabId, helperGen, pending.rootUrl, { active: true });
       await chrome.tabs.remove(tabId);
@@ -734,11 +743,7 @@ async function handleAuthFailure(tabId, reason = "authentication-failed") {
   };
   await setPending(tabId, updated);
   const nextUrl = manual || !dockerRecovery ? updated.rootUrl : updated.bootstrapUrl;
-  if (generation !== null) {
-    await navigateOwnedTab(tabId, generation, nextUrl);
-  } else {
-    await chrome.tabs.update(tabId, { url: nextUrl });
-  }
+  await navigateOwnedTab(tabId, generation, nextUrl);
   return {
     action: manual
       ? "manual"
@@ -1413,13 +1418,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (typeof changeInfo.url === "string") {
-    void (async () => {
-      const pending = await getPending(tabId);
-      const result = tabNavigations.handleUrlChange(tabId, changeInfo.url, pending);
-      if (result.cancelled) {
-        await cancelNavigation(tabId, "url-mismatch");
-      }
-    })();
+    const result = tabNavigations.handleUrlChange(tabId, changeInfo.url);
+    if (result.cancelled) {
+      void cancelNavigation(tabId, "url-mismatch", result.generation);
+    }
   }
 
   if (changeInfo.status === "complete" && typeof tab.url === "string") {

@@ -627,6 +627,7 @@ export function matchesExpectedNavigation(
 export class TabNavigationManager {
   constructor() {
     this.states = new Map();
+    this.latestGenerations = new Map();
   }
 
   begin(tabId) {
@@ -638,13 +639,16 @@ export class TabNavigationManager {
         // Ignore
       }
     }
-    const generation = (previous?.generation ?? 0) + 1;
+    const lastGen = this.latestGenerations.get(tabId) ?? (previous?.generation ?? 0);
+    const generation = lastGen + 1;
+    this.latestGenerations.set(tabId, generation);
     const abortController = new AbortController();
     const state = {
       tabId,
       generation,
       expectedUrl: null,
       expectedUrls: new Set(),
+      pending: null,
       abortController,
       cancelled: false,
       startedAt: Date.now()
@@ -659,6 +663,10 @@ export class TabNavigationManager {
 
   getGeneration(tabId) {
     return this.states.get(tabId)?.generation ?? null;
+  }
+
+  getLatestGeneration(tabId) {
+    return this.latestGenerations.get(tabId) ?? null;
   }
 
   getAbortSignal(tabId, generation = null) {
@@ -681,6 +689,23 @@ export class TabNavigationManager {
       return false;
     }
     return true;
+  }
+
+  setPending(tabId, pending, generation = null) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+      return false;
+    }
+    state.pending = pending;
+    return true;
+  }
+
+  getPending(tabId, generation = null) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+      return null;
+    }
+    return state.pending ?? null;
   }
 
   setExpectedUrl(tabId, generation, url) {
@@ -712,28 +737,32 @@ export class TabNavigationManager {
     }
   }
 
-  handleUrlChange(tabId, newUrl, pending = null) {
+  handleUrlChange(tabId, newUrl, fallbackPending = null) {
     const state = this.states.get(tabId);
     if (!state || state.cancelled) {
-      return { active: false, matched: false, cancelled: false };
+      return { active: false, matched: false, cancelled: false, generation: state?.generation ?? null };
     }
 
     if (isIgnoredNavigationUrl(newUrl)) {
       return { active: true, matched: true, cancelled: false, generation: state.generation };
     }
 
+    const pending = state.pending ?? fallbackPending;
     if (matchesExpectedNavigation(state.expectedUrls, pending, newUrl, state.expectedUrl)) {
       this.addExpectedUrl(tabId, state.generation, newUrl);
       return { active: true, matched: true, cancelled: false, generation: state.generation };
     }
 
-    this.cancel(tabId, "url-mismatch");
+    this.cancel(tabId, "url-mismatch", state.generation);
     return { active: false, matched: false, cancelled: true, generation: state.generation };
   }
 
-  cancel(tabId, reason = "cancelled") {
+  cancel(tabId, reason = "cancelled", targetGeneration = null) {
     const state = this.states.get(tabId);
     if (!state) {
+      return null;
+    }
+    if (targetGeneration !== null && state.generation !== targetGeneration) {
       return null;
     }
     state.cancelled = true;
@@ -753,5 +782,6 @@ export class TabNavigationManager {
       this.cancel(tabId, "clear");
     }
     this.states.clear();
+    this.latestGenerations.clear();
   }
 }
