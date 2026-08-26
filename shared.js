@@ -624,6 +624,28 @@ export function matchesExpectedNavigation(
   return false;
 }
 
+export function parsePendingEnvelope(stored) {
+  if (!stored || typeof stored !== "object") {
+    return null;
+  }
+  if ("pending" in stored && stored.pending) {
+    return {
+      generation: Number.isInteger(Number(stored.generation)) ? Number(stored.generation) : null,
+      pending: stored.pending,
+      expectedUrl: typeof stored.expectedUrl === "string" ? stored.expectedUrl : null,
+      expectedUrls: Array.isArray(stored.expectedUrls) ? stored.expectedUrls : [],
+      savedAt: Number(stored.savedAt) || 0
+    };
+  }
+  return {
+    generation: null,
+    pending: stored,
+    expectedUrl: null,
+    expectedUrls: [],
+    savedAt: 0
+  };
+}
+
 export class TabNavigationManager {
   constructor() {
     this.states = new Map();
@@ -655,6 +677,57 @@ export class TabNavigationManager {
     };
     this.states.set(tabId, state);
     return generation;
+  }
+
+  rehydrate(tabId, { generation, expectedUrl = null, expectedUrls = [], pending = null } = {}) {
+    if (!Number.isInteger(generation) || generation <= 0) {
+      return null;
+    }
+    const previous = this.states.get(tabId);
+    if (previous?.abortController) {
+      try {
+        previous.abortController.abort();
+      } catch {
+        // Ignore
+      }
+    }
+    const lastGen = this.latestGenerations.get(tabId) ?? 0;
+    this.latestGenerations.set(tabId, Math.max(lastGen, generation));
+
+    let normalizedExpected = null;
+    if (expectedUrl) {
+      try {
+        normalizedExpected = normalizeNavigableUrl(expectedUrl);
+      } catch {
+        normalizedExpected = null;
+      }
+    }
+
+    const normalizedSet = new Set();
+    if (normalizedExpected) {
+      normalizedSet.add(normalizedExpected);
+    }
+    for (const item of expectedUrls || []) {
+      try {
+        normalizedSet.add(normalizeNavigableUrl(item));
+      } catch {
+        // Ignore invalid URL
+      }
+    }
+
+    const abortController = new AbortController();
+    const state = {
+      tabId,
+      generation,
+      expectedUrl: normalizedExpected,
+      expectedUrls: normalizedSet,
+      pending,
+      abortController,
+      cancelled: false,
+      startedAt: Date.now()
+    };
+    this.states.set(tabId, state);
+    return state;
   }
 
   get(tabId) {

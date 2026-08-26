@@ -20,6 +20,7 @@ import {
   isConfiguredTargetPage,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
   normalizeNavigableUrl,
+  parsePendingEnvelope,
   sanitizeSettings,
   shouldStopDockerRecovery,
   TabNavigationManager,
@@ -203,25 +204,127 @@ function pendingKey(tabId) {
   return `${PENDING_PREFIX}${tabId}`;
 }
 
-async function getPending(tabId) {
-  const memory = tabNavigations.getPending(tabId);
+async function getPending(tabId, generation = null) {
+  const memory = tabNavigations.getPending(tabId, generation);
   if (memory) {
     return memory;
   }
   const key = pendingKey(tabId);
   const result = await chrome.storage.session.get(key);
-  return result[key] ?? null;
+  const envelope = parsePendingEnvelope(result[key]);
+  if (!envelope) {
+    return null;
+  }
+  if (generation !== null && envelope.generation !== null && envelope.generation !== generation) {
+    return null;
+  }
+  return envelope.pending;
 }
 
-async function setPending(tabId, pending) {
-  const generation = tabNavigations.getGeneration(tabId);
-  tabNavigations.setPending(tabId, pending, generation);
-  await chrome.storage.session.set({ [pendingKey(tabId)]: pending });
+async function setPending(tabId, pending, generation) {
+  if (!Number.isInteger(generation) || !tabNavigations.isActive(tabId, generation)) {
+    return false;
+  }
+
+  const accepted = tabNavigations.setPending(tabId, pending, generation);
+  if (!accepted) {
+    return false;
+  }
+
+  const state = tabNavigations.get(tabId);
+  const envelope = {
+    generation,
+    pending,
+    expectedUrl: state?.expectedUrl ?? null,
+    expectedUrls: state ? Array.from(state.expectedUrls) : [],
+    savedAt: Date.now()
+  };
+
+  await chrome.storage.session.set({ [pendingKey(tabId)]: envelope });
+
+  if (!tabNavigations.isActive(tabId, generation)) {
+    await removePending(tabId, generation);
+    return false;
+  }
+
+  return true;
 }
 
-async function removePending(tabId) {
-  tabNavigations.setPending(tabId, null);
-  await chrome.storage.session.remove(pendingKey(tabId));
+async function removePending(tabId, generation = null) {
+  tabNavigations.setPending(tabId, null, generation);
+
+  const key = pendingKey(tabId);
+  if (generation !== null) {
+    const stored = await chrome.storage.session.get(key);
+    const envelope = parsePendingEnvelope(stored[key]);
+    if (envelope && envelope.generation !== null && envelope.generation !== generation) {
+      return;
+    }
+  }
+
+  await chrome.storage.session.remove(key);
+}
+
+async function ensureNavigationContext(tabId) {
+  if (!Number.isInteger(tabId)) {
+    return null;
+  }
+
+  if (tabNavigations.isActive(tabId)) {
+    return {
+      active: true,
+      generation: tabNavigations.getGeneration(tabId),
+      pending: tabNavigations.getPending(tabId),
+      state: tabNavigations.get(tabId)
+    };
+  }
+
+  const key = pendingKey(tabId);
+  const stored = await chrome.storage.session.get(key);
+  const envelope = parsePendingEnvelope(stored[key]);
+  if (!envelope || !envelope.pending) {
+    return null;
+  }
+
+  let currentTab;
+  try {
+    currentTab = await chrome.tabs.get(tabId);
+  } catch {
+    await removePending(tabId, envelope.generation);
+    await removeLanDiscovery(tabId);
+    return null;
+  }
+
+  if (typeof currentTab?.url !== "string") {
+    await removePending(tabId, envelope.generation);
+    await removeLanDiscovery(tabId);
+    return null;
+  }
+
+  const allowedUrls = new Set(envelope.expectedUrls || []);
+  const isAllowed = isIgnoredNavigationUrl(currentTab.url)
+    || matchesExpectedNavigation(allowedUrls, envelope.pending, currentTab.url, envelope.expectedUrl);
+
+  if (!isAllowed) {
+    await removePending(tabId, envelope.generation);
+    await removeLanDiscovery(tabId);
+    return null;
+  }
+
+  const generation = envelope.generation || beginNavigation(tabId);
+  const state = tabNavigations.rehydrate(tabId, {
+    generation,
+    expectedUrl: envelope.expectedUrl,
+    expectedUrls: allowedUrls,
+    pending: envelope.pending
+  });
+
+  return {
+    active: true,
+    generation,
+    pending: envelope.pending,
+    state
+  };
 }
 
 function beginNavigation(tabId) {
@@ -235,7 +338,7 @@ async function cancelNavigation(tabId, reason = "cancelled", targetGeneration = 
   }
   tabNavigations.cancel(tabId, reason, targetGeneration);
   tabTransitionQueues.delete(tabId);
-  await removePending(tabId);
+  await removePending(tabId, targetGeneration);
   await removeLanDiscovery(tabId);
   try {
     await chrome.action.setBadgeText({ text: "" });
@@ -448,11 +551,13 @@ async function beginRecovery(tabId, settings, source = "new-tab", explicitGenera
     nextRetryAt: now,
     source
   };
-  await setPending(tabId, pending);
+  const targetUrl = dockerRecovery ? pending.bootstrapUrl : pending.rootUrl;
+  tabNavigations.setExpectedUrl(tabId, generation, targetUrl);
+  await setPending(tabId, pending, generation);
   await navigateOwnedTab(
     tabId,
     generation,
-    dockerRecovery ? pending.bootstrapUrl : pending.rootUrl
+    targetUrl
   );
 }
 
@@ -484,7 +589,8 @@ async function beginTargetFirst(tabId, settings, source = "new-tab", explicitGen
     lastAttemptAt: now,
     source
   };
-  await setPending(tabId, pending);
+  tabNavigations.setExpectedUrl(tabId, generation, pending.targetUrl);
+  await setPending(tabId, pending, generation);
   await navigateOwnedTab(tabId, generation, pending.targetUrl);
 }
 
@@ -508,7 +614,7 @@ async function fallbackFromUnreachableLan(tabId, generation, settings) {
     return;
   }
 
-  await removePending(tabId);
+  await removePending(tabId, generation);
   await navigateOwnedTab(tabId, generation, settings.targetUrl);
 }
 
@@ -572,7 +678,7 @@ async function tryOpenLearnedLanRoute(tabId, settings, generation) {
     return null;
   }
 
-  await removePending(tabId);
+  await removePending(tabId, generation);
   const nav = await navigateOwnedTab(tabId, generation, route.targetUrl);
   if (!nav.ok) {
     return null;
@@ -625,14 +731,14 @@ async function openConfiguredPage(tabId, source = "new-tab", explicitGeneration 
     return { action: "checking-target", themeMode: settings.themeMode };
   }
 
-  await removePending(tabId);
+  await removePending(tabId, generation);
   await navigateOwnedTab(tabId, generation, settings.targetUrl);
   return { action: "navigating", themeMode: settings.themeMode };
 }
 
 async function navigateToTarget(tabId, pending, reason, explicitGeneration = null) {
-  const generation = explicitGeneration ?? tabNavigations.getGeneration(tabId);
-  if (generation !== null && !tabNavigations.isActive(tabId, generation)) {
+  const generation = explicitGeneration ?? (tabNavigations.getGeneration(tabId) || beginNavigation(tabId));
+  if (!tabNavigations.isActive(tabId, generation)) {
     return { action: "ignored" };
   }
   if (pending.phase === "manual") {
@@ -662,7 +768,7 @@ async function navigateToTarget(tabId, pending, reason, explicitGeneration = nul
       ...pending,
       phase: "manual",
       lastError: "docker-visible-retry-limit"
-    });
+    }, generation);
     return { action: "manual" };
   }
 
@@ -680,17 +786,17 @@ async function navigateToTarget(tabId, pending, reason, explicitGeneration = nul
     lastAttemptReason: reason,
     lastAttemptAt: Date.now()
   };
-  await setPending(tabId, updated);
+  await setPending(tabId, updated, generation);
   await navigateOwnedTab(tabId, generation, updated.targetUrl);
   return { action: "navigating" };
 }
 
-async function handleAuthFailure(tabId, reason = "authentication-failed") {
-  const generation = tabNavigations.getGeneration(tabId) || beginNavigation(tabId);
+async function handleAuthFailure(tabId, reason = "authentication-failed", explicitGeneration = null) {
+  const generation = explicitGeneration ?? (tabNavigations.getGeneration(tabId) || beginNavigation(tabId));
   if (!tabNavigations.isActive(tabId, generation)) {
     return { action: "ignored" };
   }
-  const pending = await getPending(tabId);
+  const pending = await getPending(tabId, generation);
   if (!pending || !canAcceptTargetResult(pending.phase)) {
     return { action: "ignored" };
   }
@@ -704,7 +810,7 @@ async function handleAuthFailure(tabId, reason = "authentication-failed") {
       helperTabId: null,
       lastError: reason,
       rootEnteredAt: Date.now()
-    });
+    }, helperGen);
     await cancelNavigation(tabId, "lan-target-auth-failed", generation);
     try {
       await navigateOwnedTab(helperTabId, helperGen, pending.rootUrl, { active: true });
@@ -741,7 +847,7 @@ async function handleAuthFailure(tabId, reason = "authentication-failed") {
     dockerFrameReadyAt: null,
     lastError: reason
   };
-  await setPending(tabId, updated);
+  await setPending(tabId, updated, generation);
   const nextUrl = manual || !dockerRecovery ? updated.rootUrl : updated.bootstrapUrl;
   await navigateOwnedTab(tabId, generation, nextUrl);
   return {
@@ -753,9 +859,10 @@ async function handleAuthFailure(tabId, reason = "authentication-failed") {
   };
 }
 
-async function completeDockerBootstrap(tabId, destinationUrl = "", allowExternal = false) {
-  const pending = await getPending(tabId);
-  if (!pending || !isDockerPending(pending) || pending.phase !== "bootstrap") {
+async function completeDockerBootstrap(tabId, destinationUrl = "", allowExternal = false, explicitGeneration = null) {
+  const generation = explicitGeneration ?? tabNavigations.getGeneration(tabId);
+  const pending = await getPending(tabId, generation);
+  if (!pending || !isDockerPending(pending) || pending.phase !== "bootstrap" || !generation) {
     return { action: "ignored", pending };
   }
   if (
@@ -774,7 +881,7 @@ async function completeDockerBootstrap(tabId, destinationUrl = "", allowExternal
     nextRetryAt: now,
     dockerFrameReadyAt: null
   };
-  await setPending(tabId, updated);
+  await setPending(tabId, updated, generation);
   return { action: "bootstrap-complete", pending: updated };
 }
 
@@ -801,7 +908,8 @@ async function showLanSetup(tabId, pending, lanRootUrl, route = null, explicitGe
     rootEnteredAt: Date.now(),
     nextRetryAt: Date.now()
   };
-  await setPending(tabId, updated);
+  tabNavigations.setExpectedUrl(tabId, generation, lanSetupPageUrl());
+  await setPending(tabId, updated, generation);
   await navigateOwnedTab(tabId, generation, lanSetupPageUrl());
   return { action: "lan-permission", pending: updated };
 }
@@ -815,7 +923,8 @@ async function beginDockerLanDiscovery(tabId, pending, explicitGeneration = null
     rootEnteredAt: Date.now(),
     nextRetryAt: Date.now()
   };
-  await setPending(tabId, updated);
+  tabNavigations.setExpectedUrl(tabId, generation, pending.lanRootUrl);
+  await setPending(tabId, updated, generation);
   await setLanDiscovery(tabId, {
     ownerTabId: tabId,
     remoteTargetUrl: pending.targetUrl,
@@ -848,14 +957,16 @@ async function beginNativeLanRecovery(tabId, pending, explicitGeneration = null)
     rootEnteredAt: Date.now(),
     nextRetryAt: Date.now()
   };
-  await setPending(tabId, updated);
+  tabNavigations.setExpectedUrl(tabId, generation, route.rootUrl);
+  await setPending(tabId, updated, generation);
   await navigateOwnedTab(tabId, generation, route.rootUrl);
   return { action: "lan-root" };
 }
 
 async function startPermittedLanSetup(tabId) {
-  const generation = tabNavigations.getGeneration(tabId) || beginNavigation(tabId);
-  const pending = await getPending(tabId);
+  const navContext = await ensureNavigationContext(tabId);
+  const generation = navContext?.generation ?? beginNavigation(tabId);
+  const pending = navContext?.pending ?? await getPending(tabId, generation);
   if (!pending || pending.phase !== "lan-permission" || !pending.lanRootUrl) {
     return { action: "ignored" };
   }
@@ -879,7 +990,7 @@ async function startPermittedLanSetup(tabId) {
       if (!tabNavigations.isActive(tabId, generation)) {
         return { action: "ignored" };
       }
-      await removePending(tabId);
+      await removePending(tabId, generation);
       await navigateOwnedTab(tabId, generation, route.targetUrl);
       return { action: "navigating-lan" };
     }
@@ -891,12 +1002,13 @@ async function startPermittedLanSetup(tabId) {
   return beginNativeLanRecovery(tabId, pending, generation);
 }
 
-async function openNativeLanTarget(helperTabId, pending) {
+async function openNativeLanTarget(helperTabId, pending, explicitGeneration = null) {
   if (!pending || pending.phase !== "lan-root") {
     return { action: "ignored" };
   }
+  const helperGen = explicitGeneration ?? (tabNavigations.getGeneration(helperTabId) || beginNavigation(helperTabId));
   const helperPending = { ...pending, phase: "lan-helper" };
-  await setPending(helperTabId, helperPending);
+  await setPending(helperTabId, helperPending, helperGen);
   const helperTab = await chrome.tabs.get(helperTabId);
   const targetTab = await chrome.tabs.create({
     url: "about:blank",
@@ -905,14 +1017,16 @@ async function openNativeLanTarget(helperTabId, pending) {
     windowId: helperTab.windowId
   });
   const targetGen = beginNavigation(targetTab.id);
-  await setPending(targetTab.id, {
+  const targetPending = {
     ...pending,
     phase: "target",
     helperTabId,
     targetAttempts: Number(pending.targetAttempts ?? 0) + 1,
     lastAttemptReason: "lan-health-ready",
     lastAttemptAt: Date.now()
-  });
+  };
+  tabNavigations.setExpectedUrl(targetTab.id, targetGen, pending.targetUrl);
+  await setPending(targetTab.id, targetPending, targetGen);
   await navigateOwnedTab(targetTab.id, targetGen, pending.targetUrl);
   return { action: "navigating", tabId: targetTab.id };
 }
@@ -921,7 +1035,8 @@ async function handlePrivateLanNavigation(tabId, tabUrl) {
   if (!isPrivateNetworkUrl(tabUrl)) {
     return false;
   }
-  const pending = await getPending(tabId);
+  const navContext = await ensureNavigationContext(tabId);
+  const pending = navContext?.pending ?? await getPending(tabId);
   if (!pending) {
     return false;
   }
@@ -950,7 +1065,7 @@ async function handlePrivateLanNavigation(tabId, tabUrl) {
     && new URL(storedRoute.targetUrl).hostname === new URL(lanRootUrl).hostname
       ? storedRoute
       : null;
-  const generation = tabNavigations.getGeneration(tabId) || beginNavigation(tabId);
+  const generation = navContext?.generation ?? (tabNavigations.getGeneration(tabId) || beginNavigation(tabId));
   if (!await chrome.permissions.contains({ origins: [pattern] })) {
     await showLanSetup(tabId, pending, lanRootUrl, compatibleStoredRoute, generation);
     return true;
@@ -971,7 +1086,7 @@ async function handlePrivateLanNavigation(tabId, tabUrl) {
       isDockerPending(pending)
     );
   }
-  await setPending(tabId, setupPending);
+  await setPending(tabId, setupPending, generation);
   if (isDockerPending(pending)) {
     if (setupPending.lanTargetUrl) {
       const route = await saveLanRoute(pending.targetUrl, {
@@ -983,7 +1098,7 @@ async function handlePrivateLanNavigation(tabId, tabUrl) {
       const signal = tabNavigations.getAbortSignal(tabId, generation);
       if ((await probeLanHealth(route, { signal })).ok) {
         if (tabNavigations.isActive(tabId, generation)) {
-          await removePending(tabId);
+          await removePending(tabId, generation);
           await navigateOwnedTab(tabId, generation, route.targetUrl);
           return true;
         }
@@ -1066,13 +1181,15 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
 
 async function handleCompletedBootstrapNavigation(tabId, tabUrl) {
   return serializeTabTransition(tabId, async () => {
-    const pending = await getPending(tabId);
+    const navContext = await ensureNavigationContext(tabId);
+    const pending = navContext?.pending;
     if (
       !pending
       || !isDockerPending(pending)
       || pending.phase !== "bootstrap"
       || isBootstrapTransitUrl(pending, tabUrl)
       || isConfiguredTargetPage(pending, tabUrl)
+      || !navContext?.generation
     ) {
       return;
     }
@@ -1094,14 +1211,15 @@ async function handleCompletedBootstrapNavigation(tabId, tabUrl) {
       return;
     }
 
-    const completion = await completeDockerBootstrap(tabId, tabUrl, true);
+    const completion = await completeDockerBootstrap(tabId, tabUrl, true, navContext.generation);
     if (completion.action !== "bootstrap-complete") {
       return;
     }
     await navigateToTarget(
       tabId,
       completion.pending,
-      "official-bootstrap-external-route"
+      "official-bootstrap-external-route",
+      navContext.generation
     );
   });
 }
@@ -1189,16 +1307,18 @@ async function handleMessage(message, sender) {
   }
 
   if (type === "CONTENT_HELLO") {
+    const navContext = await ensureNavigationContext(senderTabId);
     const settings = await loadSettings();
     return {
-      pending: await getPending(senderTabId),
+      pending: navContext?.pending ?? null,
       settings,
       deviceRoute: await getLanRoute(settings.targetUrl)
     };
   }
 
   if (type === "GET_LAN_SETUP") {
-    const pending = await getPending(senderTabId);
+    const navContext = await ensureNavigationContext(senderTabId);
+    const pending = navContext?.pending;
     if (!pending || pending.phase !== "lan-permission") {
       return { action: "ignored" };
     }
@@ -1221,20 +1341,24 @@ async function handleMessage(message, sender) {
 
   if (type === "LAN_NATIVE_READY") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
-      return openNativeLanTarget(senderTabId, pending);
+      const navContext = await ensureNavigationContext(senderTabId);
+      return openNativeLanTarget(senderTabId, navContext?.pending, navContext?.generation);
     });
   }
 
   if (type === "BOOTSTRAP_COMPLETE") {
     return serializeTabTransition(
       senderTabId,
-      () => completeDockerBootstrap(senderTabId, sender.url)
+      async () => {
+        const navContext = await ensureNavigationContext(senderTabId);
+        return completeDockerBootstrap(senderTabId, sender.url, false, navContext?.generation);
+      }
     );
   }
 
   if (type === "PROBE_AUTH") {
-    const pending = await getPending(senderTabId);
+    const navContext = await ensureNavigationContext(senderTabId);
+    const pending = navContext?.pending;
     const frameReady = Boolean(
       pending
       && isDockerPending(pending)
@@ -1247,7 +1371,7 @@ async function handleMessage(message, sender) {
       return { ok: false, reason: "not-configured" };
     }
 
-    const signal = tabNavigations.getAbortSignal(senderTabId);
+    const signal = tabNavigations.getAbortSignal(senderTabId, navContext?.generation);
     const backgroundResult = await probeAuth(checkUrl, { signal });
     if (!pending || !isDockerPending(pending)) {
       return backgroundResult;
@@ -1267,27 +1391,31 @@ async function handleMessage(message, sender) {
 
   if (type === "AUTH_READY") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
-      if (!pending || !canNavigateToRecoveryTarget(pending.phase)) {
+      const navContext = await ensureNavigationContext(senderTabId);
+      const pending = navContext?.pending;
+      if (!pending || !canNavigateToRecoveryTarget(pending.phase) || !navContext?.generation) {
         return { action: "ignored" };
       }
       return navigateToTarget(
         senderTabId,
         pending,
-        message.via === "page" ? "health" : "health-background"
+        message.via === "page" ? "health" : "health-background",
+        navContext.generation
       );
     });
   }
 
   if (type === "DOCKER_FRAME_PROBE_RESULT") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
+      const navContext = await ensureNavigationContext(senderTabId);
+      const pending = navContext?.pending;
       if (
         !pending
         || !isDockerPending(pending)
         || pending.phase !== "root"
         || sender.frameId === 0
         || typeof sender.url !== "string"
+        || !navContext?.generation
       ) {
         return { action: "ignored" };
       }
@@ -1311,7 +1439,7 @@ async function handleMessage(message, sender) {
         await setPending(senderTabId, {
           ...pending,
           dockerFrameReadyAt: Date.now()
-        });
+        }, navContext.generation);
         return { action: "ready" };
       }
       return { action: "waiting" };
@@ -1320,24 +1448,32 @@ async function handleMessage(message, sender) {
 
   if (type === "TRY_TARGET") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
-      if (!pending || !canNavigateToRecoveryTarget(pending.phase)) {
+      const navContext = await ensureNavigationContext(senderTabId);
+      const pending = navContext?.pending;
+      if (!pending || !canNavigateToRecoveryTarget(pending.phase) || !navContext?.generation) {
         return { action: "ignored" };
       }
-      return navigateToTarget(senderTabId, pending, "root-grace-period");
+      return navigateToTarget(senderTabId, pending, "root-grace-period", navContext.generation);
     });
   }
 
   if (type === "AUTH_INVALID") {
     return serializeTabTransition(
       senderTabId,
-      () => handleAuthFailure(senderTabId, message.reason)
+      async () => {
+        const navContext = await ensureNavigationContext(senderTabId);
+        if (!navContext?.generation) {
+          return { action: "ignored" };
+        }
+        return handleAuthFailure(senderTabId, message.reason, navContext.generation);
+      }
     );
   }
 
   if (type === "TARGET_READY") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
+      const navContext = await ensureNavigationContext(senderTabId);
+      const pending = navContext?.pending;
       if (
         !pending
         || !canAcceptTargetResult(pending.phase)
@@ -1347,7 +1483,7 @@ async function handleMessage(message, sender) {
         return { action: "ignored" };
       }
       const helperTabId = Number(pending.helperTabId);
-      await cancelNavigation(senderTabId, "target-ready");
+      await cancelNavigation(senderTabId, "target-ready", navContext?.generation);
       if (Number.isInteger(helperTabId)) {
         await cancelNavigation(helperTabId, "target-ready-helper");
         try {
@@ -1362,7 +1498,8 @@ async function handleMessage(message, sender) {
 
   if (type === "MANUAL_RETRY") {
     return serializeTabTransition(senderTabId, async () => {
-      const pending = await getPending(senderTabId);
+      const navContext = await ensureNavigationContext(senderTabId);
+      const pending = navContext?.pending ?? await getPending(senderTabId);
       if (!pending) {
         return { action: "ignored" };
       }
@@ -1388,7 +1525,7 @@ async function handleMessage(message, sender) {
         rootEnteredAt: dockerRecovery ? null : now,
         nextRetryAt: now
       };
-      await setPending(senderTabId, updated);
+      await setPending(senderTabId, updated, generation);
       if (dockerRecovery) {
         await navigateOwnedTab(senderTabId, generation, updated.bootstrapUrl);
         return { action: "navigating" };

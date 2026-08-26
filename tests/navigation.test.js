@@ -12,7 +12,8 @@ import {
   isDockerPending,
   DEFAULT_SETTINGS,
   sanitizeSettings,
-  chooseInitialNavigation
+  chooseInitialNavigation,
+  parsePendingEnvelope
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -425,5 +426,237 @@ test("P0.3: Multi-phase recovery in-memory pending tracking preserves ownership 
   assert.equal(manager.handleUrlChange(tabId, "https://example.org/").cancelled, true);
   assert.equal(manager.isActive(tabId, gen), false);
 });
+
+test("P0.1, P0.2 & P0.6: Stale async callback cannot revive pending or pollute storage after user navigation", async () => {
+  const sessionStorageMock = new Map();
+  const manager = new TabNavigationManager();
+  const tabId = 301;
+  const gen1 = manager.begin(tabId);
+
+  async function mockSetPending(id, pending, generation) {
+    if (!Number.isInteger(generation) || !manager.isActive(id, generation)) {
+      return false;
+    }
+    const accepted = manager.setPending(id, pending, generation);
+    if (!accepted) {
+      return false;
+    }
+    const state = manager.get(id);
+    const envelope = {
+      generation,
+      pending,
+      expectedUrl: state?.expectedUrl ?? null,
+      expectedUrls: state ? Array.from(state.expectedUrls) : [],
+      savedAt: Date.now()
+    };
+    sessionStorageMock.set(`pending-recovery:${id}`, envelope);
+    if (!manager.isActive(id, generation)) {
+      sessionStorageMock.delete(`pending-recovery:${id}`);
+      return false;
+    }
+    return true;
+  }
+
+  // Set initial valid pending
+  const initialPending = { phase: "bootstrap", targetUrl: "https://demo.fnos.net/" };
+  assert.equal(await mockSetPending(tabId, initialPending, gen1), true);
+  assert.ok(sessionStorageMock.has(`pending-recovery:${tabId}`));
+
+  // User navigates away to github.com
+  manager.handleUrlChange(tabId, "https://github.com/");
+  assert.equal(manager.isActive(tabId, gen1), false);
+
+  // Stale callback returns and tries to write updated pending with old gen1
+  const stalePending = { phase: "target", targetUrl: "https://demo.fnos.net/" };
+  const writeResult = await mockSetPending(tabId, stalePending, gen1);
+  assert.equal(writeResult, false);
+
+  // Assert memory state is not revived
+  assert.equal(manager.getPending(tabId, gen1), null);
+});
+
+test("P0.4 & P0.7: Delayed cleanup from generation N does not delete generation N+1 storage", async () => {
+  const sessionStorageMock = new Map();
+
+  async function mockRemovePending(tabId, generation = null) {
+    const key = `pending-recovery:${tabId}`;
+    if (generation !== null) {
+      const stored = sessionStorageMock.get(key);
+      const envelope = parsePendingEnvelope(stored);
+      if (envelope && envelope.generation !== null && envelope.generation !== generation) {
+        return; // Mismatched generation: keep stored pending
+      }
+    }
+    sessionStorageMock.delete(key);
+  }
+
+  const tabId = 302;
+  // Generation 1 was active and then Generation 2 starts and writes its state
+  const gen2Envelope = {
+    generation: 2,
+    pending: { phase: "target", targetUrl: "https://target.fnos.net/" },
+    expectedUrl: "https://target.fnos.net/",
+    expectedUrls: ["https://target.fnos.net/"],
+    savedAt: Date.now()
+  };
+  sessionStorageMock.set(`pending-recovery:${tabId}`, gen2Envelope);
+
+  // Stale cleanup from Generation 1 arrives
+  await mockRemovePending(tabId, 1);
+
+  // Generation 2 storage MUST remain intact
+  assert.ok(sessionStorageMock.has(`pending-recovery:${tabId}`));
+  const preserved = sessionStorageMock.get(`pending-recovery:${tabId}`);
+  assert.equal(preserved.generation, 2);
+  assert.equal(preserved.pending.targetUrl, "https://target.fnos.net/");
+
+  // Generation 2's own cleanup should properly delete it
+  await mockRemovePending(tabId, 2);
+  assert.equal(sessionStorageMock.has(`pending-recovery:${tabId}`), false);
+});
+
+test("P1.8: Service Worker restart rehydrates navigation ownership when tab is on valid recovery page", async () => {
+  const tabId = 303;
+  const originalGen = 5;
+
+  // Persisted state before Service Worker was terminated
+  const persistedEnvelope = {
+    generation: originalGen,
+    expectedUrl: "https://5ddd.com/demo-nas/",
+    expectedUrls: ["https://5ddd.com/demo-nas/", "https://demo-nas.5ddd.com/"],
+    pending: {
+      recoveryKind: "docker",
+      phase: "bootstrap",
+      bootstrapUrl: "https://5ddd.com/demo-nas/",
+      rootUrl: "https://demo-nas.5ddd.com/",
+      targetUrl: "https://service-0.demo-nas.5ddd.com/"
+    },
+    savedAt: Date.now()
+  };
+
+  // Simulate SW restart: brand new TabNavigationManager instance (empty memory)
+  const restartedManager = new TabNavigationManager();
+  assert.equal(restartedManager.isActive(tabId), false);
+
+  // Helper simulating ensureNavigationContext
+  function mockEnsureNavigationContext(id, currentTabUrl) {
+    if (restartedManager.isActive(id)) {
+      return {
+        active: true,
+        generation: restartedManager.getGeneration(id),
+        pending: restartedManager.getPending(id)
+      };
+    }
+    const envelope = parsePendingEnvelope(persistedEnvelope);
+    if (!envelope || !envelope.pending) return null;
+
+    const allowedUrls = new Set(envelope.expectedUrls || []);
+    const isAllowed = isIgnoredNavigationUrl(currentTabUrl)
+      || matchesExpectedNavigation(allowedUrls, envelope.pending, currentTabUrl, envelope.expectedUrl);
+
+    if (!isAllowed) {
+      return null;
+    }
+
+    const gen = envelope.generation || restartedManager.begin(id);
+    const state = restartedManager.rehydrate(id, {
+      generation: gen,
+      expectedUrl: envelope.expectedUrl,
+      expectedUrls: allowedUrls,
+      pending: envelope.pending
+    });
+    return {
+      active: true,
+      generation: gen,
+      pending: envelope.pending,
+      state
+    };
+  }
+
+  // Current tab is still on the bootstrap URL
+  const context = mockEnsureNavigationContext(tabId, "https://5ddd.com/demo-nas/");
+  assert.ok(context);
+  assert.equal(context.active, true);
+  assert.equal(context.generation, 5);
+  assert.equal(restartedManager.isActive(tabId, 5), true);
+  assert.equal(restartedManager.getPending(tabId, 5)?.phase, "bootstrap");
+
+  // Abort signal is created and valid
+  const signal = restartedManager.getAbortSignal(tabId, 5);
+  assert.ok(signal);
+  assert.equal(signal.aborted, false);
+
+  // Monotonicity: next navigation on this tab will not regress below generation 5
+  const nextGen = restartedManager.begin(tabId);
+  assert.equal(nextGen, 6);
+});
+
+test("P1.9: Service Worker restart + user already navigated away purges stale state without rehydrating", async () => {
+  const tabId = 304;
+  const persistedStorage = new Map();
+  persistedStorage.set(`pending-recovery:${tabId}`, {
+    generation: 5,
+    expectedUrl: "https://5ddd.com/demo-nas/",
+    expectedUrls: ["https://5ddd.com/demo-nas/"],
+    pending: {
+      recoveryKind: "docker",
+      phase: "bootstrap",
+      targetUrl: "https://service-0.demo-nas.5ddd.com/"
+    }
+  });
+
+  const restartedManager = new TabNavigationManager();
+
+  function mockEnsureNavigationContext(id, currentTabUrl) {
+    if (restartedManager.isActive(id)) {
+      return { active: true, generation: restartedManager.getGeneration(id) };
+    }
+    const key = `pending-recovery:${id}`;
+    const envelope = parsePendingEnvelope(persistedStorage.get(key));
+    if (!envelope || !envelope.pending) return null;
+
+    const allowedUrls = new Set(envelope.expectedUrls || []);
+    const isAllowed = isIgnoredNavigationUrl(currentTabUrl)
+      || matchesExpectedNavigation(allowedUrls, envelope.pending, currentTabUrl, envelope.expectedUrl);
+
+    if (!isAllowed) {
+      persistedStorage.delete(key);
+      return null;
+    }
+    return restartedManager.rehydrate(id, envelope);
+  }
+
+  // User in the meantime navigated to google.com
+  const context = mockEnsureNavigationContext(tabId, "https://www.google.com/");
+  assert.equal(context, null);
+  assert.equal(restartedManager.isActive(tabId), false);
+  assert.equal(persistedStorage.has(`pending-recovery:${tabId}`), false);
+});
+
+test("P1.10: Restarted worker with new generation N+1 rejects stale events from generation N", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 305;
+
+  // New tab starts generation 2 after worker restart
+  const gen2 = manager.rehydrate(tabId, {
+    generation: 2,
+    expectedUrl: "https://new-target.fnos.net/",
+    expectedUrls: ["https://new-target.fnos.net/"],
+    pending: { phase: "target", targetUrl: "https://new-target.fnos.net/" }
+  });
+  assert.ok(gen2);
+
+  // Stale event from Generation 1 arrives
+  const oldPending = { phase: "root", targetUrl: "https://old-target.fnos.net/" };
+  assert.equal(manager.setPending(tabId, oldPending, 1), false);
+  assert.equal(manager.cancel(tabId, "stale-cancel", 1), null);
+  assert.equal(manager.getAbortSignal(tabId, 1), null);
+
+  // Generation 2 remains active and unaffected
+  assert.equal(manager.isActive(tabId, 2), true);
+  assert.equal(manager.getPending(tabId, 2)?.targetUrl, "https://new-target.fnos.net/");
+  assert.equal(manager.getAbortSignal(tabId, 2)?.aborted, false);
+});
+
 
 
