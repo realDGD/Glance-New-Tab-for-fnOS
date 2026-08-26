@@ -14,19 +14,6 @@ function applyTheme(mode) {
 }
 
 async function start() {
-  const initial = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
-  if (initial?.error) {
-    throw new Error(initial.error);
-  }
-  applyTheme(initial?.settings?.themeMode);
-
-  if (!initial?.settings?.setupCompleted || !initial.settings.targetUrl) {
-    statusElement.textContent = "首次使用，请先填写你的飞牛主页地址。";
-    optionsButton.textContent = "开始设置";
-    document.body.classList.add("idle");
-    return;
-  }
-
   const currentTab = await chrome.tabs.getCurrent();
   const response = await chrome.runtime.sendMessage({
     type: "OPEN_NEW_TAB",
@@ -37,15 +24,17 @@ async function start() {
     throw new Error(response.error);
   }
 
-  if (response?.action === "stay") {
-    statusElement.textContent = "自动打开已暂停，可在扩展设置中重新启用。";
+  applyTheme(response?.themeMode);
+
+  if (response?.action === "configure") {
+    statusElement.textContent = "首次使用，请先填写你的飞牛主页地址。";
+    optionsButton.textContent = "开始设置";
     document.body.classList.add("idle");
     return;
   }
 
-  if (response?.action === "configure") {
-    statusElement.textContent = "请先完成飞牛地址设置。";
-    optionsButton.textContent = "开始设置";
+  if (response?.action === "stay") {
+    statusElement.textContent = "自动打开已暂停，可在扩展设置中重新启用。";
     document.body.classList.add("idle");
     return;
   }

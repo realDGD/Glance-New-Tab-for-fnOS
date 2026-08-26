@@ -414,3 +414,344 @@ export function isSamePage(left, right) {
     return false;
   }
 }
+
+export function isDockerPending(pending) {
+  return pending?.recoveryKind === "docker"
+    || isDockerFnConnectService(
+      pending?.targetUrl,
+      pending?.rootUrl,
+      pending?.checkUrl
+    );
+}
+
+export function isSameNavigatedUrl(expected, actual) {
+  if (!expected || !actual) {
+    return false;
+  }
+  try {
+    if (expected === actual) {
+      return true;
+    }
+    const exp = new URL(normalizeNavigableUrl(expected));
+    const act = new URL(normalizeNavigableUrl(actual));
+    const normalizePath = (p) => p.length > 1 ? p.replace(/\/+$/, "") : p;
+    if (
+      exp.origin === act.origin
+      && normalizePath(exp.pathname) === normalizePath(act.pathname)
+      && exp.search === act.search
+    ) {
+      return true;
+    }
+    return isSamePage(exp.href, act.href);
+  } catch {
+    return false;
+  }
+}
+
+export function isBootstrapTransitUrl(pending, value) {
+  try {
+    const actual = new URL(normalizeNavigableUrl(value));
+    if (actual.hostname === "check.fnos.net" || actual.hostname === "ctest.fnos.net") {
+      return true;
+    }
+    if (!pending?.bootstrapUrl) {
+      return false;
+    }
+    const expected = new URL(normalizeNavigableUrl(pending.bootstrapUrl));
+    const normalizePath = (p) => p.length > 1 ? p.replace(/\/+$/, "") : p;
+    return actual.origin === expected.origin
+      && normalizePath(actual.pathname) === normalizePath(expected.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isConfiguredRootOrigin(pending, value) {
+  try {
+    if (!pending?.rootUrl) {
+      return false;
+    }
+    return new URL(normalizeNavigableUrl(pending.rootUrl)).origin
+      === new URL(normalizeNavigableUrl(value)).origin;
+  } catch {
+    return false;
+  }
+}
+
+export function isConfiguredRootPage(pending, value) {
+  try {
+    if (!pending?.rootUrl) {
+      return false;
+    }
+    if (isSamePage(pending.rootUrl, value)) {
+      return true;
+    }
+    const expected = new URL(normalizeNavigableUrl(pending.rootUrl));
+    const actual = new URL(normalizeNavigableUrl(value));
+    if (expected.origin !== actual.origin) {
+      return false;
+    }
+    const actualPath = actual.pathname.length > 1
+      ? actual.pathname.replace(/\/+$/, "")
+      : actual.pathname;
+    const expectedPath = expected.pathname.length > 1
+      ? expected.pathname.replace(/\/+$/, "")
+      : expected.pathname;
+    return actualPath === expectedPath || actualPath === "/login" || actualPath === "";
+  } catch {
+    return false;
+  }
+}
+
+export function isConfiguredTargetPage(pending, value) {
+  try {
+    if (!pending?.targetUrl) {
+      return false;
+    }
+    const expected = new URL(normalizeNavigableUrl(pending.targetUrl));
+    const actual = new URL(normalizeNavigableUrl(value));
+    const normalizePath = (path) => path.length > 1 ? path.replace(/\/+$/, "") : path;
+    return expected.origin === actual.origin
+      && normalizePath(expected.pathname) === normalizePath(actual.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isIgnoredNavigationUrl(url) {
+  if (!url || typeof url !== "string") {
+    return true;
+  }
+  if (url.startsWith("chrome-error://")) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "chrome-extension:" && parsed.pathname.endsWith("newtab.html")) {
+      return true;
+    }
+  } catch {
+    // Ignore invalid url parse
+  }
+  return false;
+}
+
+export function matchesExpectedNavigation(
+  expectedUrls,
+  pending,
+  newUrl,
+  primaryExpectedUrl = null
+) {
+  if (primaryExpectedUrl && isSameNavigatedUrl(primaryExpectedUrl, newUrl)) {
+    return true;
+  }
+
+  if (expectedUrls) {
+    for (const expected of expectedUrls) {
+      if (isSameNavigatedUrl(expected, newUrl)) {
+        return true;
+      }
+    }
+  }
+
+  if (pending) {
+    if (isDockerPending(pending) && pending.phase === "bootstrap") {
+      if (pending.bootstrapUrl && isBootstrapTransitUrl(pending, newUrl)) {
+        return true;
+      }
+      if (pending.rootUrl && isConfiguredRootPage(pending, newUrl)) {
+        return true;
+      }
+      if (
+        pending.targetUrl
+        && (isConfiguredTargetPage(pending, newUrl) || isSamePage(pending.targetUrl, newUrl))
+      ) {
+        return true;
+      }
+    }
+
+    if (["root", "target", "manual", "lan-root"].includes(pending.phase)) {
+      if (pending.rootUrl && isConfiguredRootPage(pending, newUrl)) {
+        return true;
+      }
+      if (
+        pending.targetUrl
+        && (isConfiguredTargetPage(pending, newUrl) || isSamePage(pending.targetUrl, newUrl))
+      ) {
+        return true;
+      }
+      if (
+        pending.lanRootUrl
+        && isConfiguredRootPage({ rootUrl: pending.lanRootUrl }, newUrl)
+      ) {
+        return true;
+      }
+      if (
+        pending.lanTargetUrl
+        && isConfiguredTargetPage({ targetUrl: pending.lanTargetUrl }, newUrl)
+      ) {
+        return true;
+      }
+    }
+
+    if (pending.phase === "lan-permission") {
+      try {
+        const parsed = new URL(newUrl);
+        if (
+          parsed.pathname.endsWith("newtab.html")
+          && parsed.searchParams.get("mode") === "lan-setup"
+        ) {
+          return true;
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (pending.phase === "lan-discovery") {
+      if (
+        pending.lanRootUrl
+        && isConfiguredRootPage({ rootUrl: pending.lanRootUrl }, newUrl)
+      ) {
+        return true;
+      }
+      if (pending.lanRootUrl && isLanGlanceCandidate(newUrl, pending.lanRootUrl)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+export class TabNavigationManager {
+  constructor() {
+    this.states = new Map();
+  }
+
+  begin(tabId) {
+    const previous = this.states.get(tabId);
+    if (previous?.abortController) {
+      try {
+        previous.abortController.abort();
+      } catch {
+        // Ignore
+      }
+    }
+    const generation = (previous?.generation ?? 0) + 1;
+    const abortController = new AbortController();
+    const state = {
+      tabId,
+      generation,
+      expectedUrl: null,
+      expectedUrls: new Set(),
+      abortController,
+      cancelled: false,
+      startedAt: Date.now()
+    };
+    this.states.set(tabId, state);
+    return generation;
+  }
+
+  get(tabId) {
+    return this.states.get(tabId) ?? null;
+  }
+
+  getGeneration(tabId) {
+    return this.states.get(tabId)?.generation ?? null;
+  }
+
+  getAbortSignal(tabId, generation = null) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled) {
+      return null;
+    }
+    if (generation !== null && state.generation !== generation) {
+      return null;
+    }
+    return state.abortController?.signal ?? null;
+  }
+
+  isActive(tabId, generation = null) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled) {
+      return false;
+    }
+    if (generation !== null && state.generation !== generation) {
+      return false;
+    }
+    return true;
+  }
+
+  setExpectedUrl(tabId, generation, url) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+      return false;
+    }
+    try {
+      const normalized = normalizeNavigableUrl(url);
+      state.expectedUrl = normalized;
+      state.expectedUrls.add(normalized);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  addExpectedUrl(tabId, generation, url) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+      return false;
+    }
+    try {
+      const normalized = normalizeNavigableUrl(url);
+      state.expectedUrls.add(normalized);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  handleUrlChange(tabId, newUrl, pending = null) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled) {
+      return { active: false, matched: false, cancelled: false };
+    }
+
+    if (isIgnoredNavigationUrl(newUrl)) {
+      return { active: true, matched: true, cancelled: false, generation: state.generation };
+    }
+
+    if (matchesExpectedNavigation(state.expectedUrls, pending, newUrl, state.expectedUrl)) {
+      this.addExpectedUrl(tabId, state.generation, newUrl);
+      return { active: true, matched: true, cancelled: false, generation: state.generation };
+    }
+
+    this.cancel(tabId, "url-mismatch");
+    return { active: false, matched: false, cancelled: true, generation: state.generation };
+  }
+
+  cancel(tabId, reason = "cancelled") {
+    const state = this.states.get(tabId);
+    if (!state) {
+      return null;
+    }
+    state.cancelled = true;
+    if (state.abortController) {
+      try {
+        state.abortController.abort();
+      } catch {
+        // Ignore
+      }
+    }
+    this.states.delete(tabId);
+    return state;
+  }
+
+  clear() {
+    for (const [tabId] of this.states) {
+      this.cancel(tabId, "clear");
+    }
+    this.states.clear();
+  }
+}
