@@ -7,11 +7,18 @@ import {
   chooseInitialNavigation,
   combineDockerProbeSignals,
   DEFAULT_SETTINGS,
+  hostPermissionPattern,
+  inferLanHealthUrl,
+  inferLanNativeTargetUrl,
   inferFnOsBootstrapUrl,
   inferFnOsHealthUrl,
   inferFnOsRootUrl,
   isDockerFnConnectService,
+  isGlanceDocument,
+  isLanGlanceCandidate,
   isFnOsUrl,
+  isPrivateNetworkHostname,
+  isPrivateNetworkUrl,
   isSamePage,
   isSuccessfulHealthResponse,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
@@ -42,6 +49,77 @@ test("recognizes fnOS Connect hostnames but not lookalike domains", () => {
   assert.equal(isFnOsUrl("https://5ddd.com/demo-nas/"), true);
   assert.equal(isFnOsUrl("https://evil5ddd.com/app/test/"), false);
   assert.equal(isFnOsUrl("https://5ddd.com.example.org/"), false);
+});
+
+test("recognizes private LAN hosts without accepting public lookalikes", () => {
+  for (const hostname of [
+    "10.0.0.10",
+    "172.16.0.1",
+    "172.31.255.254",
+    "192.168.1.10",
+    "localhost",
+    "gdnashost.local",
+    "fd00::1"
+  ]) {
+    assert.equal(isPrivateNetworkHostname(hostname), true, hostname);
+  }
+  for (const hostname of [
+    "172.15.0.1",
+    "172.32.0.1",
+    "192.169.1.1",
+    "8.8.8.8",
+    "fcevil.example"
+  ]) {
+    assert.equal(isPrivateNetworkHostname(hostname), false, hostname);
+  }
+  assert.equal(isPrivateNetworkUrl("http://10.0.0.10:5000/"), true);
+  assert.equal(isPrivateNetworkUrl("https://demo-nas.5ddd.com/"), false);
+  assert.equal(
+    hostPermissionPattern("http://10.0.0.10:18080/"),
+    "http://10.0.0.10/*"
+  );
+  assert.equal(
+    hostPermissionPattern("http://[fd00::1]:18080/"),
+    "http://[fd00::1]/*"
+  );
+});
+
+test("derives native LAN routes while Docker health follows the mapped port", () => {
+  const nativeTarget = inferLanNativeTargetUrl(
+    "https://demo-nas.5ddd.com/app/glance-homepage/",
+    "http://10.0.0.10:5000/"
+  );
+  assert.equal(
+    nativeTarget,
+    "http://10.0.0.10:5000/app/glance-homepage/"
+  );
+  assert.equal(
+    inferLanHealthUrl(nativeTarget, false),
+    "http://10.0.0.10:5000/app/glance-homepage/__fnos/health"
+  );
+  assert.equal(
+    inferLanHealthUrl("http://10.0.0.10:18080/", true),
+    "http://10.0.0.10:18080/api/healthz"
+  );
+});
+
+test("only considers a different service on the same LAN NAS a discovery candidate", () => {
+  const root = "http://10.0.0.10:5000/";
+  assert.equal(isLanGlanceCandidate("http://10.0.0.10:18080/", root), true);
+  assert.equal(isLanGlanceCandidate(root, root), false);
+  assert.equal(isLanGlanceCandidate("http://10.0.0.11:18080/", root), false);
+  assert.equal(isLanGlanceCandidate("https://example.org/", root), false);
+});
+
+test("recognizes Glance using several stable document signals instead of its title", () => {
+  const glanceDocument = `<!doctype html>
+    <html data-theme="default" data-scheme="dark"><head>
+    <script>const pageData = { slug: "home" };</script>
+    <link rel="manifest" href="/manifest.json?v=1">
+    <link rel="stylesheet" href="/static/abc123/css/bundle.css">
+    <title>Completely customized</title></head></html>`;
+  assert.equal(isGlanceDocument(glanceDocument), true);
+  assert.equal(isGlanceDocument("<html><title>Glance</title></html>"), false);
 });
 
 test("infers NAS root and official health endpoint for Docker service domains", () => {

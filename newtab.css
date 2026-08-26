@@ -9,6 +9,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   min-height: 100vh;
   margin: 0;
@@ -82,6 +86,26 @@ button {
   border-radius: 0.75rem;
   font: inherit;
   font-weight: 650;
+}
+
+.primary-action {
+  margin-right: 0.5rem;
+  border-color: #2b6ff4;
+  color: white;
+  background: #2b6ff4;
+}
+
+.primary-action:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.lan-setup .card {
+  width: min(92vw, 36rem);
+}
+
+.lan-setup p {
+  min-height: 4.6rem;
 }
 
 a {

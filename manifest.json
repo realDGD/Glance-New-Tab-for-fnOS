@@ -2,12 +2,13 @@
   "manifest_version": 3,
   "name": "Glance New Tab for fnOS",
   "short_name": "Glance 新标签页",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "将 Glance 设为新标签页，并在 fnOS 会话失效时通过官方页面自动恢复后返回主页。",
   "minimum_chrome_version": "111",
   "permissions": [
     "storage",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
     "*://5ddd.com/*",
@@ -16,7 +17,9 @@
     "*://*.fnos.net/*"
   ],
   "optional_host_permissions": [
-    "file:///*"
+    "file:///*",
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js",

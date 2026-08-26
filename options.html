@@ -90,6 +90,13 @@
               <small>原生应用自动使用 <code>/__fnos/health</code>；官方 Docker Glance 自动使用 <code>/api/healthz</code>。</small>
             </label>
 
+            <label class="field">
+              <span>本机局域网主页（可选）</span>
+              <input id="lan-target-url" type="url" spellcheck="false" autocomplete="off" placeholder="Docker 可填写 http://NAS-IP:映射端口/；也可留空自动识别">
+              <small>只保存在这台电脑。Docker 留空时，进入局域网后会指导你从 fnOS 桌面打开 Glance 并自动识别；原生应用可自动推导。</small>
+            </label>
+            <div id="lan-access" class="notice" hidden></div>
+
             <button id="infer-urls" class="secondary" type="button">根据主页网址自动填写</button>
           </div>
         </section>
@@ -124,7 +131,7 @@
 
       <aside class="privacy-note">
         <strong>隐私边界</strong>
-        <span>扩展只把非敏感设置保存到 Chrome 同步存储；临时恢复状态会在浏览器会话结束时清除。扩展未申请 Cookie 权限。</span>
+        <span>远程地址等非敏感设置使用 Chrome 同步存储；局域网地址只保存在当前设备。临时恢复状态会在浏览器会话结束时清除。扩展未申请 Cookie 权限。</span>
         <a href="PRIVACY.md" target="_blank">查看隐私说明</a>
       </aside>
     </main>

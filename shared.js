@@ -15,6 +15,15 @@ const SAFE_PROTOCOLS = new Set(["http:", "https:", "file:", "about:", "chrome:"]
 const FNOS_CONNECT_SUFFIXES = ["5ddd.com", "fnos.net"];
 export const MAX_DOCKER_RECOVERY_ATTEMPTS = 2;
 
+function parseIPv4(hostname) {
+  const parts = String(hostname ?? "").split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) {
+    return null;
+  }
+  const octets = parts.map(Number);
+  return octets.every((octet) => octet >= 0 && octet <= 255) ? octets : null;
+}
+
 function clampInteger(value, fallback, minimum, maximum) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) {
@@ -66,6 +75,116 @@ export function isFnOsUrl(value) {
   } catch {
     return false;
   }
+}
+
+export function isPrivateNetworkHostname(hostname) {
+  const normalized = String(hostname ?? "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized.endsWith(".local")) {
+    return true;
+  }
+
+  const ipv4 = parseIPv4(normalized);
+  if (ipv4) {
+    return ipv4[0] === 10
+      || ipv4[0] === 127
+      || (ipv4[0] === 169 && ipv4[1] === 254)
+      || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+      || (ipv4[0] === 192 && ipv4[1] === 168);
+  }
+
+  const isIPv6 = normalized.includes(":");
+  return isIPv6 && (
+    normalized === "::1"
+    || normalized.startsWith("fc")
+    || normalized.startsWith("fd")
+    || /^fe[89ab]/.test(normalized)
+  );
+}
+
+export function isPrivateNetworkUrl(value) {
+  try {
+    const parsed = new URL(normalizeNavigableUrl(value));
+    return (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && isPrivateNetworkHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function hostPermissionPattern(value) {
+  const parsed = new URL(normalizeNavigableUrl(value));
+  if (!new Set(["http:", "https:"]).has(parsed.protocol)) {
+    throw new Error("局域网权限只支持 http 或 https 地址");
+  }
+  return `${parsed.protocol}//${parsed.hostname}/*`;
+}
+
+export function appendUrlPath(baseUrl, path) {
+  const base = new URL(normalizeNavigableUrl(baseUrl));
+  const basePath = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
+  base.pathname = `${basePath}${String(path).replace(/^\/+/, "")}`;
+  base.search = "";
+  base.hash = "";
+  return base.href;
+}
+
+export function inferLanNativeTargetUrl(remoteTargetUrl, lanRootUrl) {
+  const remote = new URL(normalizeNavigableUrl(remoteTargetUrl));
+  const root = new URL(normalizeNavigableUrl(lanRootUrl));
+  if (!isPrivateNetworkUrl(root.href)) {
+    throw new Error("局域网 fnOS 地址必须使用私有网络主机");
+  }
+  root.pathname = remote.pathname;
+  root.search = remote.search;
+  root.hash = remote.hash;
+  return root.href;
+}
+
+export function inferLanHealthUrl(targetUrl, docker = false) {
+  const target = new URL(normalizeNavigableUrl(targetUrl));
+  if (docker) {
+    return appendUrlPath(target.href, "api/healthz");
+  }
+  const segments = pathSegments(target);
+  const appIndex = segments.indexOf("app");
+  const appId = appIndex >= 0 ? segments[appIndex + 1] : "";
+  if (!appId) {
+    throw new Error("无法从局域网原生应用地址识别应用 ID");
+  }
+  target.pathname = `/${segments.slice(0, appIndex + 2).join("/")}/__fnos/health`;
+  target.search = "";
+  target.hash = "";
+  return target.href;
+}
+
+export function isLanGlanceCandidate(candidateUrl, lanRootUrl) {
+  try {
+    const candidate = new URL(normalizeNavigableUrl(candidateUrl));
+    const root = new URL(normalizeNavigableUrl(lanRootUrl));
+    if (
+      !isPrivateNetworkUrl(candidate.href)
+      || candidate.hostname !== root.hostname
+      || !new Set(["http:", "https:"]).has(candidate.protocol)
+    ) {
+      return false;
+    }
+    const normalizePath = (path) => path.length > 1 ? path.replace(/\/+$/, "") : path;
+    return candidate.origin !== root.origin
+      || normalizePath(candidate.pathname) !== normalizePath(root.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isGlanceDocument(value) {
+  const html = String(value ?? "");
+  const signals = [
+    /\bconst\s+pageData\s*=\s*\{/i.test(html),
+    /<link[^>]+rel=["']manifest["'][^>]+manifest\.json/i.test(html),
+    /\/static\/[^/"']+\/css\/bundle\.css/i.test(html),
+    /\bdata-(?:theme|scheme)=["']/i.test(html)
+  ];
+  return signals.filter(Boolean).length >= 3;
 }
 
 function pathSegments(url) {

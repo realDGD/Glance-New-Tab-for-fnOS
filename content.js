@@ -13,6 +13,7 @@
   const DOCKER_READY_STABILITY_MS = 1000;
   const DOCKER_FALLBACK_GRACE_MS = 5000;
   const BOOTSTRAP_PAGE_TIMEOUT_MS = 7000;
+  const LAN_DISCOVERY_TIMEOUT_MS = 2 * 60 * 1000;
   const PAGE_SETTLE_MS = 80;
   const COMPLETION_HOLD_MS = 30;
 
@@ -24,6 +25,7 @@
   let loadingButton;
   let loadingManuallyDismissed = false;
   let stopped = false;
+  let probeSequence = 0;
 
   function send(message) {
     return chrome.runtime.sendMessage(message).catch(() => null);
@@ -512,6 +514,29 @@
     badgeButton = null;
   }
 
+  function createProbeId() {
+    probeSequence = (probeSequence + 1) % Number.MAX_SAFE_INTEGER;
+    const randomValues = new Uint32Array(2);
+    try {
+      if (typeof globalThis.crypto?.getRandomValues === "function") {
+        globalThis.crypto.getRandomValues(randomValues);
+      } else {
+        randomValues[0] = Math.floor(Math.random() * 0x100000000);
+        randomValues[1] = Math.floor(Math.random() * 0x100000000);
+      }
+    } catch {
+      randomValues[0] = Math.floor(Math.random() * 0x100000000);
+      randomValues[1] = Math.floor(Math.random() * 0x100000000);
+    }
+    return [
+      "probe",
+      Date.now().toString(36),
+      probeSequence.toString(36),
+      randomValues[0].toString(36),
+      randomValues[1].toString(36)
+    ].join("-");
+  }
+
   function pageProbe(url) {
     return new Promise((resolve) => {
       let parsed;
@@ -527,7 +552,7 @@
         return;
       }
 
-      const id = crypto.randomUUID();
+      const id = createProbeId();
       const timeout = window.setTimeout(() => {
         window.removeEventListener(RESPONSE_EVENT, onResponse);
         resolve({ ok: false, reason: "timeout", via: "page" });
@@ -550,8 +575,13 @@
   }
 
   async function probeAuth(checkUrl) {
-    const pageResult = await pageProbe(localizeFnOsUrl(checkUrl));
-    if (pageResult.ok || pageResult.reason !== "cross-origin") {
+    let pageResult;
+    try {
+      pageResult = await pageProbe(localizeFnOsUrl(checkUrl));
+    } catch {
+      pageResult = { ok: false, reason: "probe-error", via: "page" };
+    }
+    if (pageResult.ok) {
       return pageResult;
     }
     const backgroundResult = await send({ type: "PROBE_AUTH" });
@@ -590,6 +620,60 @@
   }
 
   async function recoverPending(pending, settings) {
+    if (pending.phase === "lan-discovery") {
+      await waitForDocument();
+      removeLoadingOverlay();
+      setBadge("请从 fnOS 桌面打开 Docker 中的 Glance，插件会自动识别局域网地址。");
+      window.setTimeout(() => {
+        if (!stopped) {
+          setBadge("Docker Glance 识别已超时，点击后可以重新检测。", true);
+        }
+      }, LAN_DISCOVERY_TIMEOUT_MS);
+      return;
+    }
+
+    if (pending.phase === "lan-helper") {
+      await waitForDocument();
+      removeLoadingOverlay();
+      setBadge("fnOS 局域网会话已恢复，正在新标签页确认 Glance。");
+      return;
+    }
+
+    if (pending.phase === "lan-root") {
+      await waitForDocument();
+      removeLoadingOverlay();
+      setBadge("正在确认 fnOS 局域网登录状态；如出现登录页面，请先完成登录。");
+      let round = 0;
+      const openTarget = async () => {
+        setBadge("fnOS 登录已恢复，正在新标签页打开 Glance…");
+        const response = await send({ type: "LAN_NATIVE_READY" });
+        if (response?.action === "navigating") {
+          stopped = true;
+          return;
+        }
+        stopped = true;
+        setBadge("自动打开 Glance 未完成，点击后重新检测。", true);
+      };
+      const check = async () => {
+        if (stopped) {
+          return;
+        }
+        const result = await probeAuth(pending.checkUrl);
+        if (result.ok) {
+          await openTarget();
+          return;
+        }
+        if (pageContainsLoginForm()) {
+          setBadge("请完成 fnOS 登录；成功后将自动打开 Glance。");
+        }
+        const delay = PROBE_DELAYS_MS[Math.min(round, PROBE_DELAYS_MS.length - 1)];
+        round += 1;
+        window.setTimeout(() => void check(), delay);
+      };
+      await check();
+      return;
+    }
+
     setLoading("正在检查并恢复 fnOS 登录状态…", settings);
     await waitForDocument();
     await new Promise((resolve) => window.setTimeout(resolve, PAGE_SETTLE_MS));
@@ -613,7 +697,11 @@
       stopped = true;
       setLoading("Glance 已就绪。", settings);
       await send({ type: "TARGET_READY" });
-      await startKeepAlive(settings);
+      await startKeepAlive(
+        pending.recoveryKind === "native-lan"
+          ? { ...settings, healthUrl: pending.checkUrl }
+          : settings
+      );
       await new Promise((resolve) => window.setTimeout(resolve, COMPLETION_HOLD_MS));
       removeLoadingOverlay();
       return;
@@ -874,10 +962,12 @@
     await waitForDocument();
     await new Promise((resolve) => window.setTimeout(resolve, PAGE_SETTLE_MS));
     const directFailure = pageAuthenticationFailure();
+    const isConfiguredTarget = isCurrentPage(hello.settings.targetUrl)
+      || isExactCurrentPage(hello.deviceRoute?.targetUrl);
     if (
       hello.settings?.enabled
       && hello.settings?.fnosRecoveryEnabled
-      && isCurrentPage(hello.settings.targetUrl)
+      && isConfiguredTarget
       && directFailure
     ) {
       setLoading(authenticationFailureMessage(directFailure), hello.settings);
@@ -888,8 +978,23 @@
       return;
     }
 
-    await startKeepAlive(hello.settings);
+    await startKeepAlive(
+      isExactCurrentPage(hello.deviceRoute?.targetUrl)
+        ? { ...hello.settings, healthUrl: hello.deviceRoute.healthUrl }
+        : hello.settings
+    );
   }
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "LAN_DISCOVERY_STATUS" && message.message) {
+      removeLoadingOverlay();
+      setBadge(message.message);
+    } else if (message?.type === "LAN_DISCOVERY_COMPLETE") {
+      stopped = true;
+      removeLoadingOverlay();
+      removeBadge();
+    }
+  });
 
   void main();
 })();
