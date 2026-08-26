@@ -646,6 +646,181 @@ export function parsePendingEnvelope(stored) {
   };
 }
 
+export class NavigationPersistence {
+  constructor(storageAdapter = null) {
+    this._storage = storageAdapter;
+  }
+
+  get storage() {
+    if (this._storage) {
+      return this._storage;
+    }
+    if (typeof chrome !== "undefined" && chrome?.storage?.session) {
+      return chrome.storage.session;
+    }
+    return null;
+  }
+
+  pendingKey(tabId, generation) {
+    return `pending-recovery:${tabId}:${generation}`;
+  }
+
+  activeNavKey(tabId) {
+    return `nav-active:${tabId}`;
+  }
+
+  discoveryKey(ownerTabId, generation) {
+    return `lan-discovery:${ownerTabId}:${generation}`;
+  }
+
+  async getActivePointer(tabId) {
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
+    const key = this.activeNavKey(tabId);
+    const res = await s.get(key);
+    return res[key] ?? null;
+  }
+
+  async getPendingEnvelope(tabId, generation = null) {
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
+    let targetGen = generation;
+    if (targetGen === null) {
+      const active = await this.getActivePointer(tabId);
+      if (active && Number.isInteger(active.generation)) {
+        targetGen = active.generation;
+      }
+    }
+    if (targetGen !== null) {
+      const key = this.pendingKey(tabId, targetGen);
+      const res = await s.get(key);
+      const stored = res[key];
+      if (stored) {
+        return parsePendingEnvelope(stored);
+      }
+    }
+    // Fallback for legacy single key
+    const legacyKey = `pending-recovery:${tabId}`;
+    const legacyRes = await s.get(legacyKey);
+    const legacyStored = legacyRes[legacyKey];
+    if (legacyStored) {
+      const parsed = parsePendingEnvelope(legacyStored);
+      if (parsed && (generation === null || parsed.generation === generation)) {
+        return parsed;
+      }
+    }
+    return null;
+  }
+
+  async setPendingEnvelope(tabId, generation, envelope) {
+    const s = this.storage;
+    if (!s || !Number.isInteger(generation)) {
+      return false;
+    }
+    const key = this.pendingKey(tabId, generation);
+    const activeKey = this.activeNavKey(tabId);
+    await s.set({
+      [key]: envelope,
+      [activeKey]: { generation, updatedAt: Date.now() }
+    });
+    return true;
+  }
+
+  async removePendingEnvelope(tabId, generation) {
+    const s = this.storage;
+    if (!s) {
+      return;
+    }
+    const keysToRemove = [];
+    if (Number.isInteger(generation)) {
+      keysToRemove.push(this.pendingKey(tabId, generation));
+    }
+    const legacyKey = `pending-recovery:${tabId}`;
+    keysToRemove.push(legacyKey);
+    await s.remove(keysToRemove);
+
+    const activeKey = this.activeNavKey(tabId);
+    const activeRes = await s.get(activeKey);
+    const active = activeRes[activeKey];
+    if (active && (generation === null || active.generation === generation)) {
+      await s.remove(activeKey);
+    }
+  }
+
+  async getDiscovery(ownerTabId, generation = null) {
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
+    if (generation !== null) {
+      const key = this.discoveryKey(ownerTabId, generation);
+      const res = await s.get(key);
+      return res[key] ?? null;
+    }
+    const all = await s.get(null);
+    for (const [key, value] of Object.entries(all || {})) {
+      if (key.startsWith(`lan-discovery:${ownerTabId}:`)) {
+        if (value && Number(value.expiresAt) > Date.now()) {
+          return value;
+        }
+      }
+    }
+    return null;
+  }
+
+  async setDiscovery(ownerTabId, generation, discovery) {
+    const s = this.storage;
+    if (!s || !Number.isInteger(generation)) {
+      return false;
+    }
+    const key = this.discoveryKey(ownerTabId, generation);
+    await s.set({
+      [key]: {
+        ...discovery,
+        ownerTabId,
+        generation
+      }
+    });
+    return true;
+  }
+
+  async removeDiscovery(ownerTabId, generation = null) {
+    const s = this.storage;
+    if (!s) {
+      return;
+    }
+    if (generation !== null) {
+      const key = this.discoveryKey(ownerTabId, generation);
+      await s.remove(key);
+      return;
+    }
+    const all = await s.get(null);
+    const keysToRemove = Object.keys(all || {}).filter((k) => (
+      k === `lan-discovery:${ownerTabId}` || k.startsWith(`lan-discovery:${ownerTabId}:`)
+    ));
+    if (keysToRemove.length > 0) {
+      await s.remove(keysToRemove);
+    }
+  }
+
+  async listActiveDiscoveries() {
+    const s = this.storage;
+    if (!s) {
+      return [];
+    }
+    const all = await s.get(null);
+    const now = Date.now();
+    return Object.entries(all || {})
+      .filter(([key]) => key.startsWith("lan-discovery:"))
+      .map(([, val]) => val)
+      .filter((val) => val && Number(val.expiresAt) > now && Number.isInteger(val.generation));
+  }
+}
+
 export class TabNavigationManager {
   constructor() {
     this.states = new Map();

@@ -19,6 +19,7 @@ import {
   isConfiguredRootOrigin,
   isConfiguredTargetPage,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
+  NavigationPersistence,
   normalizeNavigableUrl,
   parsePendingEnvelope,
   sanitizeSettings,
@@ -39,6 +40,7 @@ const LAN_PROBE_TIMEOUT_MS = 1800;
 let sessionClaimQueue = Promise.resolve();
 const tabTransitionQueues = new Map();
 const tabNavigations = new TabNavigationManager();
+const navPersistence = new NavigationPersistence();
 const registeredScriptPatterns = new Set();
 
 void restoreLanContentScripts();
@@ -79,28 +81,23 @@ async function removeLanRoute(remoteTargetUrl) {
   await chrome.storage.local.set({ [LAN_ROUTES_KEY]: routes });
 }
 
-function discoveryKey(ownerTabId) {
-  return `${LAN_DISCOVERY_PREFIX}${ownerTabId}`;
-}
-
 function lanUnreachableKey(targetUrl) {
   return `${LAN_UNREACHABLE_PREFIX}${routeKey(targetUrl)}`;
 }
 
-async function setLanDiscovery(ownerTabId, discovery) {
-  await chrome.storage.session.set({ [discoveryKey(ownerTabId)]: discovery });
+async function setLanDiscovery(ownerTabId, discovery, generation) {
+  if (!Number.isInteger(generation) || !tabNavigations.isActive(ownerTabId, generation)) {
+    return false;
+  }
+  return navPersistence.setDiscovery(ownerTabId, generation, discovery);
 }
 
-async function removeLanDiscovery(ownerTabId) {
-  await chrome.storage.session.remove(discoveryKey(ownerTabId));
+async function removeLanDiscovery(ownerTabId, generation = null) {
+  await navPersistence.removeDiscovery(ownerTabId, generation);
 }
 
 async function activeLanDiscoveries() {
-  const stored = await chrome.storage.session.get(null);
-  return Object.entries(stored)
-    .filter(([key]) => key.startsWith(LAN_DISCOVERY_PREFIX))
-    .map(([, value]) => value)
-    .filter((value) => value && Number(value.expiresAt) > Date.now());
+  return navPersistence.listActiveDiscoveries();
 }
 
 function scriptIdForPattern(pattern, suffix) {
@@ -200,25 +197,13 @@ async function initializeSettings(openSetupWhenNeeded = false) {
   }
 }
 
-function pendingKey(tabId) {
-  return `${PENDING_PREFIX}${tabId}`;
-}
-
 async function getPending(tabId, generation = null) {
   const memory = tabNavigations.getPending(tabId, generation);
   if (memory) {
     return memory;
   }
-  const key = pendingKey(tabId);
-  const result = await chrome.storage.session.get(key);
-  const envelope = parsePendingEnvelope(result[key]);
-  if (!envelope) {
-    return null;
-  }
-  if (generation !== null && envelope.generation !== null && envelope.generation !== generation) {
-    return null;
-  }
-  return envelope.pending;
+  const envelope = await navPersistence.getPendingEnvelope(tabId, generation);
+  return envelope?.pending ?? null;
 }
 
 async function setPending(tabId, pending, generation) {
@@ -240,7 +225,7 @@ async function setPending(tabId, pending, generation) {
     savedAt: Date.now()
   };
 
-  await chrome.storage.session.set({ [pendingKey(tabId)]: envelope });
+  await navPersistence.setPendingEnvelope(tabId, generation, envelope);
 
   if (!tabNavigations.isActive(tabId, generation)) {
     await removePending(tabId, generation);
@@ -252,17 +237,7 @@ async function setPending(tabId, pending, generation) {
 
 async function removePending(tabId, generation = null) {
   tabNavigations.setPending(tabId, null, generation);
-
-  const key = pendingKey(tabId);
-  if (generation !== null) {
-    const stored = await chrome.storage.session.get(key);
-    const envelope = parsePendingEnvelope(stored[key]);
-    if (envelope && envelope.generation !== null && envelope.generation !== generation) {
-      return;
-    }
-  }
-
-  await chrome.storage.session.remove(key);
+  await navPersistence.removePendingEnvelope(tabId, generation);
 }
 
 async function ensureNavigationContext(tabId) {
@@ -279,9 +254,7 @@ async function ensureNavigationContext(tabId) {
     };
   }
 
-  const key = pendingKey(tabId);
-  const stored = await chrome.storage.session.get(key);
-  const envelope = parsePendingEnvelope(stored[key]);
+  const envelope = await navPersistence.getPendingEnvelope(tabId);
   if (!envelope || !envelope.pending) {
     return null;
   }
@@ -291,13 +264,13 @@ async function ensureNavigationContext(tabId) {
     currentTab = await chrome.tabs.get(tabId);
   } catch {
     await removePending(tabId, envelope.generation);
-    await removeLanDiscovery(tabId);
+    await removeLanDiscovery(tabId, envelope.generation);
     return null;
   }
 
   if (typeof currentTab?.url !== "string") {
     await removePending(tabId, envelope.generation);
-    await removeLanDiscovery(tabId);
+    await removeLanDiscovery(tabId, envelope.generation);
     return null;
   }
 
@@ -307,7 +280,7 @@ async function ensureNavigationContext(tabId) {
 
   if (!isAllowed) {
     await removePending(tabId, envelope.generation);
-    await removeLanDiscovery(tabId);
+    await removeLanDiscovery(tabId, envelope.generation);
     return null;
   }
 
@@ -339,7 +312,7 @@ async function cancelNavigation(tabId, reason = "cancelled", targetGeneration = 
   tabNavigations.cancel(tabId, reason, targetGeneration);
   tabTransitionQueues.delete(tabId);
   await removePending(tabId, targetGeneration);
-  await removeLanDiscovery(tabId);
+  await removeLanDiscovery(tabId, targetGeneration);
   try {
     await chrome.action.setBadgeText({ text: "" });
   } catch {
@@ -371,6 +344,51 @@ async function navigateOwnedTab(tabId, generation, url, options = {}) {
     if (tabNavigations.isActive(tabId, generation)) {
       await cancelNavigation(tabId, "tab-update-failed", generation);
     }
+    return { ok: false, error };
+  }
+}
+
+async function removeOwnedTab(tabId, generation, reason = "close-owned-tab") {
+  if (!Number.isInteger(tabId) || !Number.isInteger(generation)) {
+    return { ok: false, reason: "invalid-params" };
+  }
+
+  if (!tabNavigations.isActive(tabId, generation)) {
+    return { ok: false, reason: "stale-generation" };
+  }
+
+  let currentTab;
+  try {
+    currentTab = await chrome.tabs.get(tabId);
+  } catch {
+    await cancelNavigation(tabId, reason, generation);
+    return { ok: false, reason: "tab-not-found" };
+  }
+
+  if (typeof currentTab?.url !== "string") {
+    await cancelNavigation(tabId, reason, generation);
+    return { ok: false, reason: "invalid-tab-url" };
+  }
+
+  const state = tabNavigations.get(tabId);
+  const allowedUrls = state ? state.expectedUrls : new Set();
+  const isAllowed = isIgnoredNavigationUrl(currentTab.url)
+    || matchesExpectedNavigation(allowedUrls, state?.pending, currentTab.url, state?.expectedUrl);
+
+  if (!isAllowed) {
+    await cancelNavigation(tabId, "user-navigated-away", generation);
+    return { ok: false, reason: "user-navigated-away" };
+  }
+
+  tabNavigations.cancel(tabId, reason, generation);
+  tabTransitionQueues.delete(tabId);
+  await removePending(tabId, generation);
+  await removeLanDiscovery(tabId, generation);
+
+  try {
+    await chrome.tabs.remove(tabId);
+    return { ok: true };
+  } catch (error) {
     return { ok: false, error };
   }
 }
@@ -811,13 +829,12 @@ async function handleAuthFailure(tabId, reason = "authentication-failed", explic
       lastError: reason,
       rootEnteredAt: Date.now()
     }, helperGen);
-    await cancelNavigation(tabId, "lan-target-auth-failed", generation);
     try {
       await navigateOwnedTab(helperTabId, helperGen, pending.rootUrl, { active: true });
-      await chrome.tabs.remove(tabId);
     } catch {
       // The helper may have been closed; a later new tab will restart recovery.
     }
+    await removeOwnedTab(tabId, generation, "lan-target-auth-failed");
     return { action: "recovering-lan" };
   }
 
@@ -1136,11 +1153,25 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
     if (!isLanGlanceCandidate(tabUrl, discovery.lanRootUrl)) {
       continue;
     }
-    const signal = tabNavigations.getAbortSignal(discovery.ownerTabId);
+    const ownerTabId = discovery.ownerTabId;
+    const generation = discovery.generation;
+    if (!Number.isInteger(ownerTabId) || !Number.isInteger(generation)) {
+      continue;
+    }
+    if (!tabNavigations.isActive(ownerTabId, generation)) {
+      continue;
+    }
+
+    const signal = tabNavigations.getAbortSignal(ownerTabId, generation);
     const result = await probeGlanceCandidate(tabUrl, { signal });
+
+    if (!tabNavigations.isActive(ownerTabId, generation)) {
+      return false;
+    }
+
     if (!result.ok) {
       await notifyLanDiscovery(
-        discovery.ownerTabId,
+        ownerTabId,
         "检测到的服务不是 Glance，请从 fnOS 桌面重新打开 Docker Glance。"
       );
       continue;
@@ -1152,17 +1183,18 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
       healthUrl: result.healthUrl,
       rootUrl: discovery.lanRootUrl
     });
-    await removeLanDiscovery(discovery.ownerTabId);
-    await removePending(discovery.ownerTabId);
+
+    if (!tabNavigations.isActive(ownerTabId, generation)) {
+      return false;
+    }
+
+    await removeLanDiscovery(ownerTabId, generation);
+    await removePending(ownerTabId, generation);
     await removePending(tabId);
     await chrome.action.setBadgeText({ text: "" });
-    if (tabId !== discovery.ownerTabId) {
-      try {
-        await cancelNavigation(discovery.ownerTabId, "lan-discovery-closed-desktop");
-        await chrome.tabs.remove(discovery.ownerTabId);
-      } catch {
-        // The user may have closed the desktop tab while Glance was opening.
-      }
+
+    if (tabId !== ownerTabId) {
+      await removeOwnedTab(ownerTabId, generation, "lan-discovery-closed-desktop");
     } else {
       try {
         await chrome.tabs.sendMessage(tabId, { type: "LAN_DISCOVERY_COMPLETE" });
@@ -1170,7 +1202,6 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
         // The verified Glance page may finish before its content script attaches.
       }
       if (route.targetUrl !== tabUrl) {
-        const generation = tabNavigations.getGeneration(tabId) || beginNavigation(tabId);
         await navigateOwnedTab(tabId, generation, route.targetUrl);
       }
     }
@@ -1485,11 +1516,11 @@ async function handleMessage(message, sender) {
       const helperTabId = Number(pending.helperTabId);
       await cancelNavigation(senderTabId, "target-ready", navContext?.generation);
       if (Number.isInteger(helperTabId)) {
-        await cancelNavigation(helperTabId, "target-ready-helper");
-        try {
-          await chrome.tabs.remove(helperTabId);
-        } catch {
-          // The helper tab may already have been closed manually.
+        const helperGen = tabNavigations.getGeneration(helperTabId);
+        if (helperGen !== null) {
+          await removeOwnedTab(helperTabId, helperGen, "target-ready-helper");
+        } else {
+          await cancelNavigation(helperTabId, "target-ready-helper");
         }
       }
       return { action: "complete" };
