@@ -165,7 +165,7 @@ async function initializeSettings(openSetupWhenNeeded = false) {
     return;
   }
 
-  // 0.1.x 曾包含开发机地址；没有 setupCompleted 标记说明仍是旧默认值。
+  // 旧版本可能没有 setupCompleted 标记，需要清除遗留默认地址。
   if (!Object.hasOwn(existing, "setupCompleted")) {
     await chrome.storage.sync.set({
       ...existing,

@@ -58,7 +58,7 @@ test("recognizes private LAN hosts without accepting public lookalikes", () => {
     "172.31.255.254",
     "192.168.1.10",
     "localhost",
-    "gdnashost.local",
+    "test-nas.local",
     "fd00::1"
   ]) {
     assert.equal(isPrivateNetworkHostname(hostname), true, hostname);
