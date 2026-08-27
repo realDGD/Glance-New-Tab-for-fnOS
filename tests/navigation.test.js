@@ -25,7 +25,11 @@ import {
   finishTargetPresentation,
   cleanupLegacyPreviewStorage,
   combineDockerProbeSignals,
-  shouldStopDockerRecovery
+  shouldStopDockerRecovery,
+  FnConnectWarmupManager,
+  WARMUP_STATE_STORAGE_KEY,
+  WARMUP_TIMEOUT_MS,
+  MAX_NEWTAB_WARMUP_WAIT_MS
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -2697,5 +2701,342 @@ test("COLD17 (T14): timing instrumentation 数据结构记录 root, background, 
   assert.equal(bgElapsed, 40);
   assert.equal(frameElapsed, 120);
   assert.equal(targetElapsed, 300);
+});
+
+function createMockTabsApi() {
+  let nextId = 500;
+  const tabs = new Map();
+  return {
+    tabs,
+    createCalls: [],
+    removeCalls: [],
+    async create(options) {
+      this.createCalls.push(options);
+      const tab = {
+        id: ++nextId,
+        url: options.url,
+        active: options.active ?? true
+      };
+      tabs.set(tab.id, tab);
+      return tab;
+    },
+    async remove(tabId) {
+      this.removeCalls.push(tabId);
+      tabs.delete(tabId);
+    },
+    async get(tabId) {
+      if (!tabs.has(tabId)) {
+        throw new Error(`Tab ${tabId} not found`);
+      }
+      return tabs.get(tabId);
+    }
+  };
+}
+
+function createMockSessionStorage() {
+  const map = new Map();
+  return {
+    map,
+    async get(key) {
+      if (key === null) return Object.fromEntries(map);
+      if (Array.isArray(key)) return Object.fromEntries(key.map((k) => [k, map.get(k)]));
+      return { [key]: map.get(key) };
+    },
+    async set(obj) {
+      for (const [k, v] of Object.entries(obj)) map.set(k, v);
+    },
+    async remove(key) {
+      const arr = Array.isArray(key) ? key : [key];
+      for (const k of arr) map.delete(k);
+    }
+  };
+}
+
+test("WARM1 (T1): onStartup 只启动一次 warmup", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const res1 = await manager.startWarmup(settings, "startup");
+  const res2 = await manager.startWarmup(settings, "startup");
+  assert.equal(res1.action, "warming");
+  assert.equal(res2.action, "already-warming");
+  assert.equal(mockTabs.createCalls.length, 1);
+});
+
+test("WARM2 (T2): single-flight - 并发调用共享同一个 warmup 流程", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const [p1, p2, p3] = await Promise.all([
+    manager.startWarmup(settings, "startup"),
+    manager.startWarmup(settings, "newtab"),
+    manager.startWarmup(settings, "newtab2")
+  ]);
+  assert.equal(p1.action, "warming");
+  assert.equal(p2.action, "already-warming");
+  assert.equal(p3.action, "already-warming");
+  assert.equal(mockTabs.createCalls.length, 1);
+});
+
+test("WARM3 (T3): helper tab 创建时 active 为 false 且为 bootstrapUrl", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  assert.equal(mockTabs.createCalls.length, 1);
+  assert.equal(mockTabs.createCalls[0].active, false);
+  assert.equal(mockTabs.createCalls[0].url, "https://5ddd.com/demo-nas/");
+});
+
+test("WARM4 (T4): warmup 达到 strict Ready 后标记 session warmed，关闭 helper tab", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  let sessionWarmedMarked = false;
+  const manager = new FnConnectWarmupManager({
+    tabsApi: mockTabs,
+    sessionStorage: mockStorage,
+    markWarmedFn: async () => { sessionWarmedMarked = true; }
+  });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const start = await manager.startWarmup(settings, "startup");
+  const helperTabId = start.helperTabId;
+  await manager.handleTabUrlCommit(helperTabId, "https://demo-nas.5ddd.com/");
+  manager.handleFrameProbeResult(helperTabId, "ready");
+  await manager.markReady();
+  assert.equal(manager.state, "ready");
+  assert.equal(sessionWarmedMarked, true);
+  assert.deepEqual(mockTabs.removeCalls, [helperTabId]);
+});
+
+test("WARM5 (T5): warmup 未 Ready 时不标记 session warmed", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  let sessionWarmedMarked = false;
+  const manager = new FnConnectWarmupManager({
+    tabsApi: mockTabs,
+    sessionStorage: mockStorage,
+    markWarmedFn: async () => { sessionWarmedMarked = true; }
+  });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  await manager.handleTabUrlCommit(manager.helperTabId, "https://demo-nas.5ddd.com/");
+  assert.equal(manager.state, "warming");
+  assert.equal(sessionWarmedMarked, false);
+});
+
+test("WARM6 (T6): warmup 进行中用户打开 New Tab，复用同一 warmup 不创建第二个 helper", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  const waitPromise = manager.waitForWarmup(101, "nav-1", settings, 5000);
+  assert.equal(mockTabs.createCalls.length, 1);
+  await manager.markReady();
+  const result = await waitPromise;
+  assert.equal(result.warmed, true);
+});
+
+test("WARM7 (T7): warmup Ready 后用户打开 New Tab 直接 target-first", () => {
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const sessionWarmed = true;
+  const nav = chooseInitialNavigation(settings, sessionWarmed);
+  assert.equal(nav, "target-first");
+});
+
+test("WARM8 (T8): learned LAN 路线有效时优先直连，不等待 Remote warmup", async () => {
+  const manager = new TabNavigationManager();
+  const mockStorage = createMockSessionStorage();
+  const lanStore = new LanRouteStore(manager, mockStorage);
+  const remoteTargetUrl = "https://demo-nas.5ddd.com/app/glance/";
+  const lanTargetUrl = "http://192.168.1.10:8080/app/glance/";
+  await lanStore.saveRoute(remoteTargetUrl, { targetUrl: lanTargetUrl, healthUrl: "http://192.168.1.10:8080/app/glance/health" });
+  const route = await lanStore.getRoute(remoteTargetUrl);
+  assert.ok(route);
+  assert.equal(route.targetUrl, lanTargetUrl);
+});
+
+test("WARM9 (T9): warmup 失败时返回失败原因并允许 foreground recovery 接管", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  const waitPromise = manager.waitForWarmup(102, "nav-2", settings, 5000);
+  await manager.cancelWarmup("network-error");
+  const result = await waitPromise;
+  assert.equal(result.warmed, false);
+  assert.equal(result.reason, "network-error");
+});
+
+test("WARM10 (T10): 用户在标签栏关闭 helper tab 时安全处理无异常抛出", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  const waitPromise = manager.waitForWarmup(103, "nav-3", settings, 5000);
+  manager.handleTabRemoved(manager.helperTabId);
+  const result = await waitPromise;
+  assert.equal(result.warmed, false);
+  assert.equal(result.reason, "helper-tab-closed");
+  assert.equal(manager.state, "failed");
+});
+
+test("WARM11 (T11): foreground 接管时先 retire helper warmup 避免双 recovery 竞争", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  const helperId = manager.helperTabId;
+  await manager.cancelWarmup("takeover-timeout");
+  assert.equal(manager.state, "failed");
+  assert.deepEqual(mockTabs.removeCalls, [helperId]);
+});
+
+test("WARM12 (T12): 旧 warmup A 的延迟事件不影响新 warmup B", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const warmA = await manager.startWarmup(settings, "startup");
+  await manager.cancelWarmup("manual-reset");
+  const warmB = await manager.startWarmup(settings, "startup2");
+  assert.notEqual(warmA.warmupId, warmB.warmupId);
+  const handled = await manager.handleTabUrlCommit(warmA.helperTabId, "https://demo-nas.5ddd.com/");
+  assert.equal(handled, false);
+});
+
+test("WARM13 (T13): Service Worker 重启后 rehydrate 恢复已有 helper tab，不新建 helper", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager1 = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const warm1 = await manager1.startWarmup(settings, "startup");
+  const manager2 = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  await manager2.rehydrate();
+  assert.equal(manager2.state, "warming");
+  assert.equal(manager2.warmupId, warm1.warmupId);
+  assert.equal(manager2.helperTabId, warm1.helperTabId);
+  assert.equal(mockTabs.createCalls.length, 1);
+});
+
+test("WARM14 (T14): Service Worker 重启时若 helper tab 已不存在，自动清理 stale warmup", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager1 = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const warm1 = await manager1.startWarmup(settings, "startup");
+  mockTabs.tabs.delete(warm1.helperTabId);
+  const manager2 = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  await manager2.rehydrate();
+  assert.equal(manager2.state, "idle");
+  const stored = await mockStorage.get(WARMUP_STATE_STORAGE_KEY);
+  assert.equal(stored[WARMUP_STATE_STORAGE_KEY], undefined);
+});
+
+test("WARM15 (T15): helper 关闭时只关闭自身 tab，不影响用户正常 tab", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const userTab = await mockTabs.create({ url: "chrome://newtab", active: true });
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const warm = await manager.startWarmup(settings, "startup");
+  await manager.markReady();
+  assert.deepEqual(mockTabs.removeCalls, [warm.helperTabId]);
+  assert.equal(mockTabs.tabs.has(userTab.id), true);
+});
+
+test("WARM16 (T16): sessionWarmed 下二次及后续打开保持 target-first 不回归", () => {
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  assert.equal(chooseInitialNavigation(settings, true), "target-first");
+});
+
+test("WARM17 (T17): New Tab 等待 warmup 期间用户主动导航离开，取消 ownership 不再强行跳转", () => {
+  const tabManager = new TabNavigationManager();
+  const tabId = 401;
+  const nav = tabManager.begin(tabId);
+  const changeResult = tabManager.handleUrlChange(tabId, "https://github.com/");
+  assert.equal(changeResult.cancelled, true);
+  assert.equal(tabManager.isActive(tabId, nav.navigationId), false);
 });
 
