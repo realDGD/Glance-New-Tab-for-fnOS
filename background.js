@@ -1461,6 +1461,12 @@ async function handleMessage(message, sender) {
         }, navContext.navigationId);
         return { action: "ready" };
       }
+      if (pending.dockerFrameReadyAt) {
+        await setPending(senderTabId, {
+          ...pending,
+          dockerFrameReadyAt: null
+        }, navContext.navigationId);
+      }
       return { action: "waiting" };
     });
   }

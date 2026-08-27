@@ -832,7 +832,12 @@
       if (stopped) {
         return;
       }
-      if (result.ok) {
+
+      const isReady = dockerRecovery
+        ? Boolean(result?.strongReady)
+        : Boolean(result?.ok);
+
+      if (isReady) {
         if (pending.phase === "manual") {
           showManualLogin(
             dockerRecovery
@@ -844,17 +849,13 @@
         }
         if (dockerRecovery) {
           const now = Date.now();
-          const strongReady = Boolean(result.strongReady);
           const minimumRootDwellMs = officialBootstrapCompleted
             ? DOCKER_BOOTSTRAP_MIN_ROOT_DWELL_MS
-            : strongReady
-              ? DOCKER_FAST_MIN_ROOT_DWELL_MS
-              : DOCKER_MIN_ROOT_DWELL_MS;
+            : DOCKER_FAST_MIN_ROOT_DWELL_MS;
           const readyStabilityMs = officialBootstrapCompleted
             ? DOCKER_BOOTSTRAP_READY_STABILITY_MS
-            : strongReady
-              ? DOCKER_FAST_READY_STABILITY_MS
-              : DOCKER_READY_STABILITY_MS;
+            : DOCKER_FAST_READY_STABILITY_MS;
+
           if (!dockerHealthReadyAt) {
             dockerHealthReadyAt = now;
           }
@@ -865,11 +866,9 @@
             || readyElapsed < readyStabilityMs
           ) {
             setLoading(
-              strongReady
-                ? officialBootstrapCompleted
-                  ? "FN Connect 官方检测与 Docker 检测均已通过，正在打开 Glance…"
-                  : "FN Connect 双重检测已通过，正在快速打开 Docker Glance…"
-                : "fnOS 会话已恢复，正在等待 FN Connect 完成 Docker 服务授权…",
+              officialBootstrapCompleted
+                ? "FN Connect 官方检测与 Docker 检测均已通过，正在打开 Glance…"
+                : "FN Connect 双重检测已通过，正在快速打开 Docker Glance…",
               settings
             );
             return;
@@ -895,7 +894,14 @@
 
       if (dockerRecovery) {
         dockerHealthReadyAt = 0;
+        if (result?.ok) {
+          setLoading(
+            "fnOS 会话已恢复，正在等待 FN Connect 完成 Docker 服务授权…",
+            settings
+          );
+        }
       }
+
       const elapsed = Date.now() - Number(pending.startedAt ?? Date.now());
       if (pending.phase === "manual") {
         showManualLogin(
@@ -913,11 +919,18 @@
       }
 
       if (elapsed >= Number(settings.recoveryTimeoutSeconds) * 1000) {
-        setLoading(
-          "仍在等待 fnOS 会话；如果需要手动登录，可以显示 fnOS 页面。",
-          settings,
+        stopped = true;
+        if (fallbackTimer) {
+          window.clearTimeout(fallbackTimer);
+        }
+        dockerProbeFrame?.remove();
+        showManualLogin(
+          dockerRecovery
+            ? "fnOS 会话已恢复，但 Docker 服务授权长时间未就绪；请重新检测。"
+            : "仍在等待 fnOS 会话；如果需要手动登录，可以显示 fnOS 页面。",
           true
         );
+        return;
       }
 
       if (!dockerRecovery) {

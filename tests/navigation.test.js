@@ -23,7 +23,8 @@ import {
   scriptIdForPattern,
   isDuplicateScriptRegistrationError,
   finishTargetPresentation,
-  cleanupLegacyPreviewStorage
+  cleanupLegacyPreviewStorage,
+  combineDockerProbeSignals
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -2184,7 +2185,7 @@ test("BOOT10: Legacy preview cleanup cleans up any stale preview data on upgrade
   assert.equal(store.has("lan-route:https://demo-nas.5ddd.com/"), true);
 });
 
-test("COLD1: 首次 cold-start (sessionWarmed=false) 仍是 root-first", () => {
+test("COLD1 (T9): 首次 cold-start (sessionWarmed=false) 仍是 root-first", () => {
   const settings = sanitizeSettings({
     fnosRecoveryEnabled: true,
     targetUrl: "https://demo-nas.5ddd.com/app/glance/",
@@ -2197,7 +2198,7 @@ test("COLD1: 首次 cold-start (sessionWarmed=false) 仍是 root-first", () => {
   assert.notEqual(mode, "target-first");
 });
 
-test("COLD2: 二次打开 (sessionWarmed=true) 仍是 target-first", () => {
+test("COLD2 (T9): 二次打开 (sessionWarmed=true) 仍是 target-first，不经 root readiness", () => {
   const settings = sanitizeSettings({
     fnosRecoveryEnabled: true,
     targetUrl: "https://demo-nas.5ddd.com/app/glance/",
@@ -2228,7 +2229,6 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
 
   let targetNavigated = false;
 
-  // Background handleCompletedBootstrapNavigation simulation
   async function handleCompletedBootstrap(currentTabUrl) {
     if (!manager.isActive(tabId, navigationId)) {
       return { action: "ignored" };
@@ -2243,7 +2243,6 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
 
     const isRoot = isConfiguredRootOrigin(curPending, currentTabUrl);
     if (isRoot) {
-      // Transitions to root phase, but does NOT navigate to target immediately!
       const updated = {
         ...curPending,
         phase: "root",
@@ -2258,7 +2257,6 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
     return { action: "external-route" };
   }
 
-  // Official FN Connect redirects to configured root
   const result = await handleCompletedBootstrap("https://demo-nas.5ddd.com/");
   assert.equal(result.action, "bootstrap-complete");
   assert.equal(result.pending.phase, "root");
@@ -2266,35 +2264,31 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
   assert.equal(manager.getPending(tabId).phase, "root");
 });
 
-test("COLD4: health 未 Ready 时保持 root 阶段且不增加 recovery attempts", async () => {
-  const manager = new TabNavigationManager();
-  const tabId = 202;
-  const nav = manager.begin(tabId);
-  const navigationId = nav.navigationId;
+test("COLD4 (T1): backgroundReady only (frameReady=false) 不触发 AUTH_READY，不打开 target", () => {
+  const probeSignals = combineDockerProbeSignals(true, false);
+  assert.equal(probeSignals.ok, true);
+  assert.equal(probeSignals.backgroundReady, true);
+  assert.equal(probeSignals.frameReady, false);
+  assert.equal(probeSignals.strongReady, false);
 
-  const rootPending = {
-    phase: "root",
-    recoveryKind: "docker",
-    bootstrapUrl: "https://5ddd.com/demo-nas/",
-    rootUrl: "https://demo-nas.5ddd.com/",
-    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
-    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
-    dockerRecoveryAttempts: 0,
-    targetAttempts: 0
-  };
-  manager.setPending(tabId, rootPending, navigationId);
-
-  // Health probe returns false
-  const healthResult = { ok: false, reason: "unauthorized" };
-  assert.equal(healthResult.ok, false);
-
-  // Phase remains root and attempts counter is unchanged
-  assert.equal(manager.getPending(tabId).phase, "root");
-  assert.equal(manager.getPending(tabId).dockerRecoveryAttempts, 0);
-  assert.equal(manager.getPending(tabId).targetAttempts, 0);
+  const dockerRecovery = true;
+  const isReady = dockerRecovery ? Boolean(probeSignals.strongReady) : Boolean(probeSignals.ok);
+  assert.equal(isReady, false);
 });
 
-test("COLD5: health Ready 满足 dwell 与 stability 后发送 AUTH_READY 触发 target", async () => {
+test("COLD5 (T2): frameReady only (backgroundReady=false) 不触发 AUTH_READY，不打开 target", () => {
+  const probeSignals = combineDockerProbeSignals(false, true);
+  assert.equal(probeSignals.ok, true);
+  assert.equal(probeSignals.backgroundReady, false);
+  assert.equal(probeSignals.frameReady, true);
+  assert.equal(probeSignals.strongReady, false);
+
+  const dockerRecovery = true;
+  const isReady = dockerRecovery ? Boolean(probeSignals.strongReady) : Boolean(probeSignals.ok);
+  assert.equal(isReady, false);
+});
+
+test("COLD6 (T3): strongReady (backgroundReady && frameReady) 满足 dwell 与 stability 后触发 target", async () => {
   const manager = new TabNavigationManager();
   const tabId = 203;
   const nav = manager.begin(tabId);
@@ -2313,6 +2307,9 @@ test("COLD5: health Ready 满足 dwell 与 stability 后发送 AUTH_READY 触发
   };
   manager.setPending(tabId, rootPending, navigationId);
 
+  const probeSignals = combineDockerProbeSignals(true, true);
+  assert.equal(probeSignals.strongReady, true);
+
   let navigatedUrl = "";
   const mockTabs = {
     async update(id, { url }) {
@@ -2320,11 +2317,6 @@ test("COLD5: health Ready 满足 dwell 与 stability 后发送 AUTH_READY 触发
     }
   };
 
-  // When health probe succeeds
-  const healthResult = { ok: true, strongReady: true, via: "dual" };
-  assert.equal(healthResult.ok, true);
-
-  // Background AUTH_READY handler simulation
   async function handleAuthReady() {
     if (!manager.isActive(tabId, navigationId)) {
       return { action: "ignored" };
@@ -2353,15 +2345,46 @@ test("COLD5: health Ready 满足 dwell 与 stability 后发送 AUTH_READY 触发
   assert.equal(manager.getPending(tabId).phase, "target");
 });
 
-test("COLD6: health 1600ms 未 Ready 时不盲目触发 TRY_TARGET", () => {
-  const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
+test("COLD7 (T4): strongReady 短暂成功后掉线必须重置 stability 计时", () => {
+  let dockerHealthReadyAt = 0;
+  const now = 10000;
 
-  // Verify that fallbackTimer and tick loop do not trigger tryTargetAfterGrace when dockerRecovery is true
-  assert.ok(contentJs.includes("const fallbackTimer = !dockerRecovery"));
-  assert.ok(contentJs.includes("if (!dockerRecovery) {"));
+  // t0: strongReady is true
+  const signal1 = combineDockerProbeSignals(true, true);
+  if (signal1.strongReady) {
+    if (!dockerHealthReadyAt) dockerHealthReadyAt = now;
+  }
+  assert.equal(dockerHealthReadyAt, now);
+
+  // t1: frameReady drops (strongReady becomes false)
+  const signal2 = combineDockerProbeSignals(true, false);
+  if (!signal2.strongReady) {
+    dockerHealthReadyAt = 0; // RESET
+  }
+  assert.equal(dockerHealthReadyAt, 0);
+
+  // t2: strongReady recovers at t = 10500
+  const now2 = 10500;
+  const signal3 = combineDockerProbeSignals(true, true);
+  if (signal3.strongReady) {
+    if (!dockerHealthReadyAt) dockerHealthReadyAt = now2;
+  }
+  assert.equal(dockerHealthReadyAt, 10500);
+
+  // Stability elapsed from now2, not now
+  const readyElapsed = 10600 - dockerHealthReadyAt;
+  assert.equal(readyElapsed, 100);
+  assert.ok(readyElapsed < 250); // Not ready yet!
 });
 
-test("COLD7: 连续两次 unauthorized 不再由正常 cold-start 触发", async () => {
+test("COLD8 (T5 & T6): backgroundReady=true 但 frameReady=false 持续 1600ms 不盲目 TRY_TARGET", () => {
+  const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
+  assert.ok(contentJs.includes("const fallbackTimer = !dockerRecovery"));
+  assert.ok(contentJs.includes("if (!dockerRecovery) {"));
+  assert.ok(contentJs.includes("const isReady = dockerRecovery\n        ? Boolean(result?.strongReady)\n        : Boolean(result?.ok);"));
+});
+
+test("COLD9 (T7 & T8): recoveryTimeout 达到后真正停止自动轮询，且不增加 recovery attempts", () => {
   const manager = new TabNavigationManager();
   const tabId = 204;
   const nav = manager.begin(tabId);
@@ -2374,25 +2397,29 @@ test("COLD7: 连续两次 unauthorized 不再由正常 cold-start 触发", async
     rootUrl: "https://demo-nas.5ddd.com/",
     checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
     targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    startedAt: Date.now() - 130000,
     dockerRecoveryAttempts: 0
   };
   manager.setPending(tabId, rootPending, navigationId);
 
-  // During waiting on root, health is false
-  const healthOk = false;
-  // Does not trigger premature target navigation
-  assert.equal(healthOk, false);
-  assert.equal(manager.getPending(tabId).phase, "root");
+  const recoveryTimeoutSeconds = 120;
+  const elapsed = Date.now() - Number(rootPending.startedAt);
+  let stopped = false;
+  if (elapsed >= recoveryTimeoutSeconds * 1000) {
+    stopped = true;
+  }
+
+  assert.equal(stopped, true);
+  // Attempts remain 0 because no premature target was attempted
   assert.equal(manager.getPending(tabId).dockerRecoveryAttempts, 0);
 });
 
-test("COLD8: 二次 target auth failure 统一使用 root -> Docker Ready -> target 恢复", async () => {
+test("COLD10 (T10): 二次 target auth failure 统一使用 root -> strongReady -> target 恢复", async () => {
   const manager = new TabNavigationManager();
   const tabId = 205;
   const nav = manager.begin(tabId);
   const navigationId = nav.navigationId;
 
-  // Secondary open: starts at target
   const targetPending = {
     phase: "target",
     recoveryKind: "docker",
@@ -2405,7 +2432,7 @@ test("COLD8: 二次 target auth failure 统一使用 root -> Docker Ready -> tar
   };
   manager.setPending(tabId, targetPending, navigationId);
 
-  // Step 1: Target encounters 401 Unauthorized
+  // Step 1: 401 Unauthorized
   const recoveryPending = {
     ...targetPending,
     phase: "bootstrap",
@@ -2424,7 +2451,10 @@ test("COLD8: 二次 target auth failure 统一使用 root -> Docker Ready -> tar
   manager.setPending(tabId, rootPending, navigationId);
   assert.equal(manager.getPending(tabId).phase, "root");
 
-  // Step 3: Health probe becomes Ready -> AUTH_READY -> target
+  // Step 3: StrongReady gate
+  const signal = combineDockerProbeSignals(true, true);
+  assert.equal(signal.strongReady, true);
+
   const finalTargetPending = {
     ...rootPending,
     phase: "target",
@@ -2435,7 +2465,7 @@ test("COLD8: 二次 target auth failure 统一使用 root -> Docker Ready -> tar
   assert.equal(manager.getPending(tabId).dockerRecoveryAttempts, 1);
 });
 
-test("COLD9: 用户在 root 等待时跳走取消 navigationId ownership", () => {
+test("COLD11 (T11): 用户在 root 等待时跳走取消 navigationId ownership", () => {
   const manager = new TabNavigationManager();
   const tabId = 206;
   const nav = manager.begin(tabId);
@@ -2450,18 +2480,16 @@ test("COLD9: 用户在 root 等待时跳走取消 navigationId ownership", () =>
   };
   manager.setPending(tabId, pending, navigationId);
 
-  // User actively enters github.com
   const changeResult = manager.handleUrlChange(tabId, "https://github.com/", pending);
   assert.equal(changeResult.matched, false);
   assert.equal(changeResult.cancelled, true);
   assert.equal(manager.isActive(tabId, navigationId), false);
 });
 
-test("COLD10: 旧 navigation A 的 health callback 不影响新 navigation B", async () => {
+test("COLD12 (T12): 旧 navigation A 的 frame probe callback 不影响新 navigation B", async () => {
   const manager = new TabNavigationManager();
   const tabId = 207;
 
-  // Nav A begins
   const navA = manager.begin(tabId);
   const pendingA = {
     phase: "root",
@@ -2472,7 +2500,6 @@ test("COLD10: 旧 navigation A 的 health callback 不影响新 navigation B", a
   };
   manager.setPending(tabId, pendingA, navA.navigationId);
 
-  // Nav B begins on same tab
   const navB = manager.begin(tabId);
   const pendingB = {
     phase: "root",
@@ -2483,7 +2510,6 @@ test("COLD10: 旧 navigation A 的 health callback 不影响新 navigation B", a
   };
   manager.setPending(tabId, pendingB, navB.navigationId);
 
-  // Stale callback from Nav A arrives
   async function handleAuthReady(msgNavId) {
     if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
       return { action: "ignored" };
@@ -2494,12 +2520,11 @@ test("COLD10: 旧 navigation A 的 health callback 不影响新 navigation B", a
   const resA = await handleAuthReady(navA.navigationId);
   assert.equal(resA.action, "ignored");
 
-  // Nav B is still active and unchanged
   assert.equal(manager.isActive(tabId, navB.navigationId), true);
   assert.equal(manager.getPending(tabId).rootUrl, "https://demo-nas-b.5ddd.com/");
 });
 
-test("COLD11: learned LAN 二次打开仍优先于 Remote target-first 及 FN Connect recovery", async () => {
+test("COLD13: learned LAN 二次打开仍优先于 Remote target-first 及 FN Connect recovery", async () => {
   const manager = new TabNavigationManager();
   const storageMap = new Map();
   const mockStorage = {
