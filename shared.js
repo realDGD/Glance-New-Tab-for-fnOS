@@ -1580,6 +1580,36 @@ export function schedulePreviewRefresh(callback, globalScope = globalThis) {
   }, 0);
 }
 
+export async function finishTargetPresentation({
+  waitForVisualReady = null,
+  fadeOut = null,
+  scheduleRefresh = null,
+  targetUrl = null,
+  isConfiguredTarget = true,
+  globalScope = globalThis
+} = {}) {
+  if (typeof waitForVisualReady === "function") {
+    await waitForVisualReady();
+  }
+  await new Promise((resolve) => {
+    if (typeof globalScope?.requestAnimationFrame === "function") {
+      globalScope.requestAnimationFrame(() => {
+        globalScope.requestAnimationFrame(resolve);
+      });
+    } else {
+      resolve();
+    }
+  });
+
+  if (typeof fadeOut === "function") {
+    await fadeOut();
+  }
+
+  if (isConfiguredTarget && typeof scheduleRefresh === "function") {
+    scheduleRefresh(targetUrl);
+  }
+}
+
 export async function saveGlancePreviewToStorage(storageArea, rootDocument, targetUrl) {
   try {
     if (!storageArea || typeof storageArea.set !== "function") {

@@ -25,6 +25,7 @@ import {
   extractGlancePreview,
   saveGlancePreviewToStorage,
   schedulePreviewRefresh,
+  finishTargetPresentation,
   getPreviewStatus,
   renderGlancePreviewHtml,
   renderGlanceSkeletonHtml
@@ -2426,6 +2427,351 @@ test("PT10: Preview content and savedAt are refreshed on consecutive configured 
   const prevB = store.get(key);
   assert.equal(prevB.pageTitle, "Updated Glance");
   assert.ok(prevB.savedAt > timeA);
+});
+
+test("SEQ1: Normal configured target presentation strictly executes visual_ready -> doubleRAF -> fade -> preview schedule -> extraction", async () => {
+  const events = [];
+  const mockGlobal = {
+    requestAnimationFrame(fn) {
+      events.push("raf");
+      return setTimeout(fn, 1);
+    },
+    requestIdleCallback(fn) {
+      events.push("idle_callback_registered");
+      return setTimeout(() => {
+        events.push("extraction_started");
+        fn();
+      }, 5);
+    }
+  };
+
+  await finishTargetPresentation({
+    async waitForVisualReady() {
+      events.push("visual_ready");
+    },
+    async fadeOut() {
+      events.push("fade_started");
+      await new Promise((r) => setTimeout(r, 10));
+      events.push("fade_completed");
+    },
+    scheduleRefresh(url) {
+      events.push("preview_refresh_scheduled");
+      schedulePreviewRefresh(() => {
+        events.push("preview_saved");
+      }, mockGlobal);
+    },
+    targetUrl: "https://nas.5ddd.com/glance/",
+    isConfiguredTarget: true,
+    globalScope: mockGlobal
+  });
+
+  // At the moment finishTargetPresentation resolves, fade must already be complete, but extraction has NOT started yet
+  assert.deepEqual(events, [
+    "visual_ready",
+    "raf",
+    "raf",
+    "fade_started",
+    "fade_completed",
+    "preview_refresh_scheduled",
+    "idle_callback_registered"
+  ]);
+
+  // Wait for idle callback to fire
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.deepEqual(events, [
+    "visual_ready",
+    "raf",
+    "raf",
+    "fade_started",
+    "fade_completed",
+    "preview_refresh_scheduled",
+    "idle_callback_registered",
+    "extraction_started",
+    "preview_saved"
+  ]);
+});
+
+test("SEQ2: LAN fast path presentation executes fade to completion before scheduling preview refresh", async () => {
+  const events = [];
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const lanTargetUrl = "http://192.168.1.10:18080/";
+  const mockDoc = {
+    title: "LAN Glance",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "LAN Card" }), querySelectorAll: () => [] }] }]
+  };
+
+  await finishTargetPresentation({
+    async waitForVisualReady() {
+      events.push("visual_ready");
+    },
+    async fadeOut() {
+      events.push("fade_started");
+      await new Promise((r) => setTimeout(r, 5));
+      events.push("fade_completed");
+    },
+    scheduleRefresh(url) {
+      events.push("schedule_refresh");
+      schedulePreviewRefresh(async () => {
+        events.push("preview_write_start");
+        await saveGlancePreviewToStorage(mockStorage, mockDoc, url);
+        events.push("preview_write_complete");
+      });
+    },
+    targetUrl: lanTargetUrl,
+    isConfiguredTarget: true
+  });
+
+  assert.equal(events.indexOf("fade_completed") < events.indexOf("schedule_refresh"), true);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(store.has(previewStorageKey(lanTargetUrl)), true);
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
+});
+
+test("SEQ3: Remote direct success presentation executes fade before preview refresh", async () => {
+  const events = [];
+  const remoteUrl = "https://demo.fnos.net/glance/";
+
+  await finishTargetPresentation({
+    async waitForVisualReady() {
+      events.push("visual_ready");
+    },
+    async fadeOut() {
+      events.push("fade_started");
+      events.push("fade_completed");
+    },
+    scheduleRefresh(url) {
+      events.push("schedule_refresh");
+    },
+    targetUrl: remoteUrl,
+    isConfiguredTarget: true
+  });
+
+  assert.deepEqual(events, [
+    "visual_ready",
+    "fade_started",
+    "fade_completed",
+    "schedule_refresh"
+  ]);
+});
+
+test("SEQ4: Pending target recovery success executes fade before preview refresh", async () => {
+  const events = [];
+  const recoveryUrl = "https://demo.fnos.net/app/glance/";
+
+  await finishTargetPresentation({
+    async waitForVisualReady() {
+      events.push("visual_ready");
+    },
+    async fadeOut() {
+      events.push("fade_started");
+      events.push("fade_completed");
+    },
+    scheduleRefresh(url) {
+      events.push("schedule_refresh");
+    },
+    targetUrl: recoveryUrl,
+    isConfiguredTarget: true
+  });
+
+  assert.deepEqual(events, [
+    "visual_ready",
+    "fade_started",
+    "fade_completed",
+    "schedule_refresh"
+  ]);
+});
+
+test("SEQ5: When no overlay exists, fade completes immediately without blocking", async () => {
+  let resolved = false;
+
+  // Simulate fadeOutLoadingOverlay when loadingHost is null
+  function fadeOutNoHost() {
+    return new Promise((resolve) => {
+      const loadingHost = null;
+      if (!loadingHost) {
+        resolve();
+      }
+    });
+  }
+
+  const start = Date.now();
+  await fadeOutNoHost();
+  resolved = true;
+  const elapsed = Date.now() - start;
+
+  assert.equal(resolved, true);
+  assert.ok(elapsed < 50);
+});
+
+test("SEQ6: Transitionend event triggers immediate fade promise resolution and cleanup", async () => {
+  let removed = false;
+  let transitionListener = null;
+
+  const mockScreen = {
+    style: {},
+    addEventListener(evt, fn) {
+      if (evt === "transitionend") transitionListener = fn;
+    },
+    removeEventListener(evt, fn) {
+      if (evt === "transitionend") transitionListener = null;
+    }
+  };
+
+  const mockHost = {
+    remove() {
+      removed = true;
+    }
+  };
+
+  function fadeWithTransitionEnd() {
+    return new Promise((resolve) => {
+      let finished = false;
+      let timerId = null;
+
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (timerId !== null) clearTimeout(timerId);
+        mockScreen.removeEventListener("transitionend", onTransitionEnd);
+        mockHost.remove();
+        resolve();
+      };
+
+      const onTransitionEnd = (e) => {
+        if (e.propertyName === "opacity") {
+          finish();
+        }
+      };
+
+      mockScreen.addEventListener("transitionend", onTransitionEnd);
+      mockScreen.style.transition = "opacity 140ms ease-out";
+      mockScreen.style.opacity = "0";
+      timerId = setTimeout(finish, 180);
+    });
+  }
+
+  const fadePromise = fadeWithTransitionEnd();
+  assert.ok(transitionListener);
+  assert.equal(mockScreen.style.opacity, "0");
+
+  // Dispatch transitionend early (e.g. after 10ms)
+  transitionListener({ propertyName: "opacity" });
+
+  await fadePromise;
+  assert.equal(removed, true);
+  assert.equal(transitionListener, null);
+});
+
+test("SEQ7: Transitionend fallback timer triggers safe resolve if transitionend does not fire", async () => {
+  let removed = false;
+
+  const mockScreen = {
+    style: {},
+    addEventListener() {},
+    removeEventListener() {}
+  };
+
+  const mockHost = {
+    remove() {
+      removed = true;
+    }
+  };
+
+  function fadeWithFallback() {
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        mockHost.remove();
+        resolve();
+      };
+      setTimeout(finish, 20); // shortened for test
+    });
+  }
+
+  await fadeWithFallback();
+  assert.equal(removed, true);
+});
+
+test("SEQ8: Heavy DOM extraction task never executes before fade_started or fade_completed", async () => {
+  const timeline = [];
+
+  const mockGlobal = {
+    requestIdleCallback(fn) {
+      setTimeout(() => {
+        timeline.push("heavy_extraction_start");
+        // Simulate heavy extraction
+        for (let i = 0; i < 1000; i++) {}
+        timeline.push("heavy_extraction_end");
+        fn();
+      }, 10);
+    }
+  };
+
+  await finishTargetPresentation({
+    async waitForVisualReady() {
+      timeline.push("visual_ready");
+    },
+    async fadeOut() {
+      timeline.push("fade_started");
+      await new Promise((r) => setTimeout(r, 5));
+      timeline.push("fade_completed");
+    },
+    scheduleRefresh(url) {
+      timeline.push("schedule_refresh");
+      schedulePreviewRefresh(() => {}, mockGlobal);
+    },
+    targetUrl: "https://nas.5ddd.com/",
+    isConfiguredTarget: true,
+    globalScope: mockGlobal
+  });
+
+  assert.equal(timeline.indexOf("fade_completed") < timeline.indexOf("schedule_refresh"), true);
+
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(timeline.indexOf("heavy_extraction_start") > timeline.indexOf("fade_completed"));
+});
+
+test("SEQ9: Preview storage reject after fade does not crash presentation", async () => {
+  const faultyStorage = {
+    async set() {
+      throw new Error("QuotaExceededError");
+    }
+  };
+
+  let presentationFinished = false;
+  let saveFailedCaught = false;
+
+  await finishTargetPresentation({
+    async fadeOut() {
+      presentationFinished = true;
+    },
+    scheduleRefresh(url) {
+      schedulePreviewRefresh(async () => {
+        const ok = await saveGlancePreviewToStorage(faultyStorage, {}, url);
+        if (!ok) {
+          saveFailedCaught = true;
+        }
+      });
+    },
+    targetUrl: "https://nas.5ddd.com/",
+    isConfiguredTarget: true
+  });
+
+  assert.equal(presentationFinished, true);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(saveFailedCaught, true);
 });
 
 

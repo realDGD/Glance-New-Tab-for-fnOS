@@ -776,45 +776,61 @@
   }
 
   function fadeOutLoadingOverlay(onComplete = null) {
-    if (!loadingHost) {
-      onComplete?.();
-      return;
-    }
-    const host = loadingHost;
-    const screen = loadingScreen;
-
-    if (screen) {
-      let finished = false;
-      const finish = () => {
-        if (finished) {
-          return;
-        }
-        finished = true;
-        screen.removeEventListener("transitionend", onTransitionEnd);
-        if (loadingHost === host) {
-          removeLoadingOverlay();
-        } else {
-          host.remove();
-        }
-        onComplete?.();
-      };
-
-      const onTransitionEnd = (e) => {
-        if (e.target === screen && (e.propertyName === "opacity" || !e.propertyName)) {
-          finish();
+    return new Promise((resolve) => {
+      const handleComplete = () => {
+        try {
+          onComplete?.();
+        } finally {
+          resolve();
         }
       };
 
-      screen.addEventListener("transitionend", onTransitionEnd);
-      screen.style.transition = "opacity 140ms ease-out";
-      screen.style.opacity = "0";
+      if (!loadingHost) {
+        handleComplete();
+        return;
+      }
+      const host = loadingHost;
+      const screen = loadingScreen;
 
-      // Fallback timer in case transitionend does not fire
-      window.setTimeout(finish, 180);
-    } else {
-      removeLoadingOverlay();
-      onComplete?.();
-    }
+      if (screen) {
+        let finished = false;
+        let timerId = null;
+
+        const finish = () => {
+          if (finished) {
+            return;
+          }
+          finished = true;
+          if (timerId !== null) {
+            window.clearTimeout(timerId);
+            timerId = null;
+          }
+          screen.removeEventListener("transitionend", onTransitionEnd);
+          if (loadingHost === host) {
+            removeLoadingOverlay();
+          } else {
+            host.remove();
+          }
+          handleComplete();
+        };
+
+        const onTransitionEnd = (e) => {
+          if (e.target === screen && (e.propertyName === "opacity" || !e.propertyName)) {
+            finish();
+          }
+        };
+
+        screen.addEventListener("transitionend", onTransitionEnd);
+        screen.style.transition = "opacity 140ms ease-out";
+        screen.style.opacity = "0";
+
+        // Fallback timer in case transitionend does not fire
+        timerId = window.setTimeout(finish, 180);
+      } else {
+        removeLoadingOverlay();
+        handleComplete();
+      }
+    });
   }
 
   async function waitForVisualReady() {
@@ -1106,8 +1122,6 @@
       stopped = true;
       await send({ type: "TARGET_READY" });
 
-      schedulePreviewRefresh(pending.targetUrl);
-
       await startKeepAlive(
         pending.recoveryKind === "native-lan"
           ? { ...settings, healthUrl: pending.checkUrl }
@@ -1116,7 +1130,8 @@
       await new Promise((resolve) => window.requestAnimationFrame(() => {
         window.requestAnimationFrame(resolve);
       }));
-      fadeOutLoadingOverlay();
+      await fadeOutLoadingOverlay();
+      schedulePreviewRefresh(pending.targetUrl);
       return;
     }
 
@@ -1410,13 +1425,13 @@
 
     if (!directFailure) {
       await waitForVisualReady();
-      if (isConfiguredTarget) {
-        schedulePreviewRefresh(location.href);
-      }
       await new Promise((resolve) => window.requestAnimationFrame(() => {
         window.requestAnimationFrame(resolve);
       }));
-      fadeOutLoadingOverlay();
+      await fadeOutLoadingOverlay();
+      if (isConfiguredTarget) {
+        schedulePreviewRefresh(location.href);
+      }
     }
   }
 
