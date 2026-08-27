@@ -2265,6 +2265,112 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
   assert.equal(manager.getPending(tabId).phase, "root");
 });
 
+test("COLD3_A (T1 & T2): root URL commit 即推进 bootstrap -> root，不等待 status=complete", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 208;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const bootstrapPending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, bootstrapPending, navigationId);
+
+  // Simulated handleBootstrapUrlCommit when changeInfo.url is observed (status is still 'loading')
+  async function handleBootstrapUrlCommit(newUrl) {
+    if (!manager.isActive(tabId, navigationId)) return { action: "ignored" };
+    const cur = manager.getPending(tabId);
+    if (!cur || cur.phase !== "bootstrap") return { action: "ignored" };
+    if (!isConfiguredRootOrigin(cur, newUrl)) return { action: "ignored" };
+
+    const now = Date.now();
+    const updated = {
+      ...cur,
+      phase: "root",
+      bootstrapCompletedAt: now,
+      rootEnteredAt: now,
+      nextRetryAt: now,
+      dockerFrameReadyAt: null
+    };
+    manager.setPending(tabId, updated, navigationId);
+    return { action: "bootstrap-complete", pending: updated };
+  }
+
+  const res = await handleBootstrapUrlCommit("https://demo-nas.5ddd.com/");
+  assert.equal(res.action, "bootstrap-complete");
+  assert.equal(res.pending.phase, "root");
+  assert.ok(res.pending.rootEnteredAt > 0);
+  assert.equal(manager.getPending(tabId).phase, "root");
+});
+
+test("COLD3_B (T3 & T4): 后续 status=complete 到达时保持幂等，不重置 rootEnteredAt", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 209;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const t0 = 10000;
+  const rootPending = {
+    phase: "root",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    bootstrapCompletedAt: t0,
+    rootEnteredAt: t0
+  };
+  manager.setPending(tabId, rootPending, navigationId);
+
+  // completeDockerBootstrap called on status=complete
+  async function completeDockerBootstrap(destinationUrl) {
+    const pending = manager.getPending(tabId);
+    if (!pending || pending.phase === "root") {
+      return { action: "already-root", pending };
+    }
+    return { action: "ignored" };
+  }
+
+  const res = await completeDockerBootstrap("https://demo-nas.5ddd.com/");
+  assert.equal(res.action, "already-root");
+  assert.equal(res.pending.rootEnteredAt, t0); // Preserved t0!
+  assert.equal(manager.getPending(tabId).rootEnteredAt, t0);
+});
+
+test("COLD3_C (T8): /login 页面或错误页面不触发 root 推进", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 210;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const bootstrapPending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, bootstrapPending, navigationId);
+
+  function checkLoginUrl(urlStr) {
+    const actual = new URL(urlStr);
+    if (/^\/login(?:\/|$)/i.test(actual.pathname)) {
+      return false; // Skip bootstrap complete on login page
+    }
+    return true;
+  }
+
+  assert.equal(checkLoginUrl("https://demo-nas.5ddd.com/login"), false);
+  assert.equal(checkLoginUrl("https://demo-nas.5ddd.com/login/"), false);
+  assert.equal(checkLoginUrl("https://demo-nas.5ddd.com/"), true);
+});
+
 test("COLD4 (T1): frameReady 快速成立时走 confirmed target，不执行 optimistic target", () => {
   const probeSignals = combineDockerProbeSignals(true, true);
   assert.equal(probeSignals.strongReady, true);

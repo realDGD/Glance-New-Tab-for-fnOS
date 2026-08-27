@@ -780,6 +780,14 @@
       frameReadyAt: 0
     };
 
+    if (document.readyState !== "complete") {
+      window.addEventListener("load", () => {
+        console.debug(
+          `[FNOS timing] root status complete +${Date.now() - timing.rootEnteredAt}ms`
+        );
+      }, { once: true });
+    }
+
     function handleRuntimeMessage(message) {
       if (stopped) {
         return;
@@ -938,7 +946,7 @@
         navigationRequested = true;
         setLoading("fnOS 登录已恢复，正在打开 Glance…", settings);
         console.debug(
-          `[FNOS timing] root complete +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready +${timing.frameReadyAt ? timing.frameReadyAt - timing.rootEnteredAt : "none"}ms | confirmed target +${now - timing.rootEnteredAt}ms`
+          `[FNOS timing] root commit +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready +${timing.frameReadyAt ? timing.frameReadyAt - timing.rootEnteredAt : "none"}ms | confirmed target +${now - timing.rootEnteredAt}ms`
         );
         const response = await send({
           type: "AUTH_READY",
@@ -963,7 +971,7 @@
           navigationRequested = true;
           setLoading("fnOS 登录已恢复，正在快速打开 Glance…", settings);
           console.debug(
-            `[FNOS timing] root complete +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready pending | optimistic target +${now - timing.rootEnteredAt}ms`
+            `[FNOS timing] root commit +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready pending | optimistic target +${now - timing.rootEnteredAt}ms`
           );
           const response = await send({
             type: "AUTH_READY",

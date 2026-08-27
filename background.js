@@ -807,7 +807,13 @@ async function handleAuthFailure(tabId, reason = "authentication-failed", explic
 async function completeDockerBootstrap(tabId, destinationUrl = "", allowExternal = false, explicitNavigationId = null) {
   const navigationId = explicitNavigationId ?? tabNavigations.getNavigationId(tabId);
   const pending = await getPending(tabId, navigationId);
-  if (!pending || !isDockerPending(pending) || pending.phase !== "bootstrap" || !navigationId) {
+  if (!pending || !isDockerPending(pending) || !navigationId) {
+    return { action: "ignored", pending };
+  }
+  if (pending.phase === "root") {
+    return { action: "already-root", pending };
+  }
+  if (pending.phase !== "bootstrap") {
     return { action: "ignored", pending };
   }
   if (
@@ -821,8 +827,8 @@ async function completeDockerBootstrap(tabId, destinationUrl = "", allowExternal
   const updated = {
     ...pending,
     phase: "root",
-    bootstrapCompletedAt: now,
-    rootEnteredAt: now,
+    bootstrapCompletedAt: pending.bootstrapCompletedAt ?? now,
+    rootEnteredAt: pending.rootEnteredAt ?? now,
     nextRetryAt: now,
     dockerFrameReadyAt: null
   };
@@ -1155,6 +1161,53 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
 }
 
 async function handleCompletedBootstrapNavigation(tabId, tabUrl) {
+  return serializeTabTransition(tabId, async () => {
+    const navContext = await ensureNavigationContext(tabId);
+    const pending = navContext?.pending;
+    if (
+      !pending
+      || !isDockerPending(pending)
+      || pending.phase !== "bootstrap"
+      || isBootstrapTransitUrl(pending, tabUrl)
+      || isConfiguredTargetPage(pending, tabUrl)
+      || !navContext?.navigationId
+    ) {
+      return;
+    }
+
+    let actual;
+    try {
+      actual = new URL(tabUrl);
+    } catch {
+      return;
+    }
+    if (!new Set(["http:", "https:"]).has(actual.protocol)) {
+      return;
+    }
+    if (/^\/login(?:\/|$)/i.test(actual.pathname)) {
+      return;
+    }
+
+    const isRoot = isConfiguredRootOrigin(pending, tabUrl);
+    if (isRoot) {
+      await completeDockerBootstrap(tabId, tabUrl, false, navContext.navigationId);
+      return;
+    }
+
+    const completion = await completeDockerBootstrap(tabId, tabUrl, true, navContext.navigationId);
+    if (completion.action !== "bootstrap-complete") {
+      return;
+    }
+    await navigateToTarget(
+      tabId,
+      completion.pending,
+      "official-bootstrap-external-route",
+      navContext.navigationId
+    );
+  });
+}
+
+async function handleBootstrapUrlCommit(tabId, tabUrl) {
   return serializeTabTransition(tabId, async () => {
     const navContext = await ensureNavigationContext(tabId);
     const pending = navContext?.pending;
@@ -1617,6 +1670,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     const result = tabNavigations.handleUrlChange(tabId, changeInfo.url);
     if (result.cancelled) {
       void cancelNavigation(tabId, "url-mismatch", result.navigationId || result.generation);
+    } else {
+      void handleBootstrapUrlCommit(tabId, changeInfo.url);
     }
   }
 
