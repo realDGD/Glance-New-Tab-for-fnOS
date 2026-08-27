@@ -289,7 +289,8 @@ async function ensureNavigationContext(tabId) {
 }
 
 function beginNavigation(tabId) {
-  return tabNavigations.begin(tabId);
+  const context = tabNavigations.begin(tabId);
+  return context.navigationId;
 }
 
 async function cancelNavigation(tabId, reason = "cancelled", targetIdentity = null) {

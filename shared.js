@@ -948,7 +948,9 @@ export class TabNavigationManager {
     const lastGen = this.latestGenerations.get(tabId) ?? (previous?.generation ?? 0);
     const generation = lastGen + 1;
     this.latestGenerations.set(tabId, generation);
-    const navigationId = explicitId || generateNavigationId();
+    const navigationId = (typeof explicitId === "string" && explicitId.length > 0)
+      ? explicitId
+      : generateNavigationId();
     const abortController = new AbortController();
     const state = {
       tabId,
@@ -964,11 +966,16 @@ export class TabNavigationManager {
       startedAt: Date.now()
     };
     this.states.set(tabId, state);
-    return generation;
+    return {
+      navigationId,
+      generation
+    };
   }
 
   rehydrate(tabId, { navigationId = null, generation = null, expectedUrl = null, expectedUrls = [], pending = null } = {}) {
-    const navId = navigationId || (generation ? `gen_${generation}` : generateNavigationId());
+    const navId = (typeof navigationId === "string" && navigationId.length > 0)
+      ? navigationId
+      : generateNavigationId();
     const previous = this.states.get(tabId);
     if (previous?.abortController) {
       try {
@@ -1041,7 +1048,7 @@ export class TabNavigationManager {
     if (!state || state.cancelled) {
       return null;
     }
-    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
+    if (identity !== null && state.navigationId !== identity) {
       return null;
     }
     return state.abortController?.signal ?? null;
@@ -1052,7 +1059,7 @@ export class TabNavigationManager {
     if (!state || state.cancelled || state.closing || state.status !== "active") {
       return false;
     }
-    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
+    if (identity !== null && state.navigationId !== identity) {
       return false;
     }
     return true;
@@ -1063,7 +1070,7 @@ export class TabNavigationManager {
     if (!state || state.cancelled || state.closing || state.status !== "active") {
       return null;
     }
-    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
+    if (identity !== null && state.navigationId !== identity) {
       return null;
     }
     state.closing = true;
@@ -1075,7 +1082,7 @@ export class TabNavigationManager {
     if (!state || state.cancelled || !state.closing) {
       return false;
     }
-    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
+    if (identity !== null && state.navigationId !== identity) {
       return false;
     }
     return true;
@@ -1083,7 +1090,7 @@ export class TabNavigationManager {
 
   setPending(tabId, pending, identity = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity)) {
       return false;
     }
     state.pending = pending;
@@ -1092,7 +1099,7 @@ export class TabNavigationManager {
 
   getPending(tabId, identity = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
+    if (!state || state.cancelled || (identity !== null && state.navigationId !== identity)) {
       return null;
     }
     return state.pending ?? null;
@@ -1100,7 +1107,7 @@ export class TabNavigationManager {
 
   setExpectedUrl(tabId, identity, url) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity)) {
       return false;
     }
     try {
@@ -1115,7 +1122,7 @@ export class TabNavigationManager {
 
   addExpectedUrl(tabId, identity, url) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity)) {
       return false;
     }
     try {
@@ -1152,7 +1159,7 @@ export class TabNavigationManager {
     if (!state) {
       return null;
     }
-    if (targetIdentity !== null && state.navigationId !== targetIdentity && state.generation !== targetIdentity) {
+    if (targetIdentity !== null && state.navigationId !== targetIdentity) {
       return null;
     }
     state.cancelled = true;
@@ -1388,8 +1395,16 @@ export class LanRouteStore {
 }
 
 export const PREVIEW_KEY_PREFIX = "glance-preview:";
+export const ACTIVE_PREVIEW_TARGET_KEY = "glance-preview-active-target";
 export const PREVIEW_TTL_FRESH_MS = 30 * 60 * 1000;
 export const PREVIEW_TTL_STALE_MS = 6 * 60 * 60 * 1000;
+
+export const SENSITIVE_QUERY_KEYS = new Set([
+  "token", "access_token", "refresh_token", "auth", "auth_token",
+  "authorization", "key", "api_key", "apikey", "secret", "session",
+  "sessionid", "sid", "ticket", "sig", "signature", "code", "jwt",
+  "credential", "credentials", "password", "passwd", "pwd"
+]);
 
 export function previewStorageKey(targetUrl) {
   const norm = normalizeNavigableUrl(targetUrl);
@@ -1406,15 +1421,17 @@ export function sanitizeSafeUrl(rawUrl) {
   }
   try {
     const parsed = new URL(rawUrl, "https://glance.local");
-    const sensitiveParams = [
-      "token", "auth", "key", "secret", "access_token", "ticket",
-      "session", "sig", "signature", "pwd", "password", "code", "refresh_token"
-    ];
-    for (const p of sensitiveParams) {
-      parsed.searchParams.delete(p);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (SENSITIVE_QUERY_KEYS.has(key.toLowerCase())) {
+        parsed.searchParams.delete(key);
+      }
     }
-    if (sensitiveParams.some((p) => parsed.hash.toLowerCase().includes(p))) {
-      parsed.hash = "";
+    const lowerHash = parsed.hash.toLowerCase();
+    for (const key of SENSITIVE_QUERY_KEYS) {
+      if (lowerHash.includes(key)) {
+        parsed.hash = "";
+        break;
+      }
     }
     return parsed.href;
   } catch {
@@ -1455,7 +1472,7 @@ export function extractGlancePreview(rootDocument, targetUrl) {
     const columns = [];
 
     const processWidget = (widgetEl) => {
-      if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i]')) {
+      if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i], input[name*="auth" i], input[type="hidden"], textarea, form')) {
         return null;
       }
 

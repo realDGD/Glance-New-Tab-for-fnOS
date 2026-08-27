@@ -207,188 +207,17 @@
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
   }
 
-  function ensureLoadingOverlay(settings) {
-    if (loadingHost || !document.documentElement) {
-      return;
-    }
+  const PREVIEW_KEY_PREFIX = "glance-preview:";
+  const ACTIVE_PREVIEW_TARGET_KEY = "glance-preview-active-target";
+  const PREVIEW_TTL_FRESH_MS = 30 * 60 * 1000;
+  const PREVIEW_TTL_STALE_MS = 6 * 60 * 60 * 1000;
 
-    const host = document.createElement("div");
-    host.id = "keep-fnnas-login-loading";
-    const shadow = host.attachShadow({ mode: "closed" });
-    const style = document.createElement("style");
-    style.textContent = `
-      :host { all: initial; }
-      .screen {
-        position: fixed;
-        z-index: 2147483647;
-        inset: 0;
-        display: grid;
-        place-items: center;
-        overflow: hidden;
-        color: #17243d;
-        background:
-          radial-gradient(circle at 20% 15%, rgba(52,122,240,.15), transparent 34rem),
-          radial-gradient(circle at 82% 86%, rgba(56,198,165,.16), transparent 32rem),
-          #f5f7fb;
-        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        -webkit-font-smoothing: antialiased;
-      }
-      .screen.dark {
-        color: #f0f4fc;
-        background:
-          radial-gradient(circle at 20% 15%, rgba(52,122,240,.22), transparent 34rem),
-          radial-gradient(circle at 82% 86%, rgba(56,198,165,.13), transparent 32rem),
-          #0e1420;
-      }
-      .card {
-        width: min(440px, calc(100vw - 44px));
-        padding: 42px 34px 34px;
-        text-align: center;
-      }
-      .animation {
-        position: relative;
-        width: 106px;
-        height: 106px;
-        margin: 0 auto 28px;
-      }
-      .ring {
-        position: absolute;
-        inset: 3px;
-        border: 2px solid rgba(52,122,240,.13);
-        border-top-color: #347af0;
-        border-radius: 50%;
-        animation: spin 1.15s linear infinite;
-      }
-      .ring.secondary {
-        inset: 13px;
-        border-color: rgba(56,198,165,.12);
-        border-right-color: #38c6a5;
-        animation-duration: 1.7s;
-        animation-direction: reverse;
-      }
-      .mark {
-        position: absolute;
-        inset: 24px;
-        display: grid;
-        place-items: center;
-        border-radius: 17px;
-        color: white;
-        background: #347af0;
-        box-shadow: 0 12px 28px rgba(52,122,240,.28);
-        font-size: 25px;
-        font-weight: 850;
-        animation: breathe 1.8s ease-in-out infinite alternate;
-      }
-      h1 {
-        margin: 0;
-        font-size: 22px;
-        letter-spacing: -.02em;
-      }
-      p {
-        min-height: 42px;
-        margin: 10px auto 19px;
-        color: #6f7c92;
-        font-size: 14px;
-        line-height: 1.55;
-      }
-      .dark p { color: #a7b4c9; }
-      .dots {
-        display: flex;
-        justify-content: center;
-        gap: 7px;
-      }
-      .dots i {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: #347af0;
-        animation: dot 1.2s ease-in-out infinite;
-      }
-      .dots i:nth-child(2) { animation-delay: .16s; }
-      .dots i:nth-child(3) { animation-delay: .32s; }
-      button {
-        display: none;
-        min-height: 38px;
-        margin: 23px auto 0;
-        padding: 0 15px;
-        border: 1px solid rgba(52,122,240,.25);
-        border-radius: 9px;
-        color: #285fae;
-        background: rgba(255,255,255,.7);
-        font: 650 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        cursor: pointer;
-      }
-      .dark button {
-        border-color: rgba(140,179,255,.3);
-        color: #c4d8ff;
-        background: rgba(32,44,65,.85);
-      }
-      button.visible { display: block; }
-      @keyframes spin { to { transform: rotate(360deg); } }
-      @keyframes breathe { to { transform: scale(.94); box-shadow: 0 8px 20px rgba(52,122,240,.2); } }
-      @keyframes dot {
-        0%, 75%, 100% { transform: translateY(0); opacity: .35; }
-        35% { transform: translateY(-5px); opacity: 1; }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .ring, .mark, .dots i { animation-duration: 3s; }
-      }
-    `;
-
-    const screen = document.createElement("div");
-    screen.className = `screen${useDarkTheme(settings) ? " dark" : ""}`;
-    const card = document.createElement("div");
-    card.className = "card";
-    const animation = document.createElement("div");
-    animation.className = "animation";
-    const ring = document.createElement("span");
-    ring.className = "ring";
-    const secondaryRing = document.createElement("span");
-    secondaryRing.className = "ring secondary";
-    const mark = document.createElement("span");
-    mark.className = "mark";
-    mark.textContent = "G";
-    animation.append(ring, secondaryRing, mark);
-
-    const title = document.createElement("h1");
-    title.textContent = "正在载入 Glance";
-    loadingText = document.createElement("p");
-    loadingText.textContent = "正在检查并恢复 fnOS 登录状态…";
-    const dots = document.createElement("div");
-    dots.className = "dots";
-    dots.append(
-      document.createElement("i"),
-      document.createElement("i"),
-      document.createElement("i")
-    );
-    loadingButton = document.createElement("button");
-    loadingButton.type = "button";
-    loadingButton.textContent = "显示 FN Connect / fnOS 页面";
-    loadingButton.addEventListener("click", () => {
-      loadingManuallyDismissed = true;
-      removeLoadingOverlay();
-      setBadge("请在 fnOS 页面完成登录，成功后将自动打开 Glance。");
-    });
-
-    card.append(animation, title, loadingText, dots, loadingButton);
-    screen.append(card);
-    shadow.append(style, screen);
-    host.style.setProperty("all", "initial", "important");
-    document.documentElement.append(host);
-    loadingHost = host;
-  }
-
-  function setLoading(message, settings, showPageButton = false) {
-    if (loadingManuallyDismissed) {
-      return;
-    }
-    removeBadge();
-    ensureLoadingOverlay(settings);
-    if (loadingText) {
-      loadingText.textContent = message;
-    }
-    loadingButton?.classList.toggle("visible", showPageButton);
-  }
+  const SENSITIVE_QUERY_KEYS = new Set([
+    "token", "access_token", "refresh_token", "auth", "auth_token",
+    "authorization", "key", "api_key", "apikey", "secret", "session",
+    "sessionid", "sid", "ticket", "sig", "signature", "code", "jwt",
+    "credential", "credentials", "password", "passwd", "pwd"
+  ]);
 
   function normalizeNavigableUrl(value) {
     const parsed = new URL(value);
@@ -402,21 +231,32 @@
     return parsed.href;
   }
 
+  function previewStorageKey(targetUrl) {
+    const norm = normalizeNavigableUrl(targetUrl);
+    const parsed = new URL(norm);
+    if (parsed.pathname.length > 1) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    }
+    return `${PREVIEW_KEY_PREFIX}${parsed.href}`;
+  }
+
   function sanitizeSafeUrl(rawUrl) {
     if (!rawUrl || typeof rawUrl !== "string") {
       return "";
     }
     try {
       const parsed = new URL(rawUrl, "https://glance.local");
-      const sensitiveParams = [
-        "token", "auth", "key", "secret", "access_token", "ticket",
-        "session", "sig", "signature", "pwd", "password", "code", "refresh_token"
-      ];
-      for (const p of sensitiveParams) {
-        parsed.searchParams.delete(p);
+      for (const key of [...parsed.searchParams.keys()]) {
+        if (SENSITIVE_QUERY_KEYS.has(key.toLowerCase())) {
+          parsed.searchParams.delete(key);
+        }
       }
-      if (sensitiveParams.some((p) => parsed.hash.toLowerCase().includes(p))) {
-        parsed.hash = "";
+      const lowerHash = parsed.hash.toLowerCase();
+      for (const key of SENSITIVE_QUERY_KEYS) {
+        if (lowerHash.includes(key)) {
+          parsed.hash = "";
+          break;
+        }
       }
       return parsed.href;
     } catch {
@@ -435,6 +275,109 @@
     return clean.slice(0, maxLength);
   }
 
+  function escapeHtml(str) {
+    return String(str ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function getPreviewStatus(preview) {
+    if (!preview || typeof preview !== "object" || !preview.savedAt) {
+      return "none";
+    }
+    const age = Date.now() - preview.savedAt;
+    if (age < PREVIEW_TTL_FRESH_MS) {
+      return "fresh";
+    }
+    if (age < PREVIEW_TTL_STALE_MS) {
+      return "stale";
+    }
+    return "expired";
+  }
+
+  function renderGlanceSkeletonHtml() {
+    return `
+      <div class="glance-preview-layout skeleton-layout" aria-hidden="true">
+        <div class="glance-preview-header">
+          <div class="glance-skeleton-bar glance-skeleton-title"></div>
+          <div class="glance-skeleton-bar glance-skeleton-time"></div>
+        </div>
+        <div class="glance-preview-columns">
+          <div class="glance-preview-col">
+            <div class="glance-preview-card skeleton-card">
+              <div class="glance-skeleton-bar card-title"></div>
+              <div class="glance-skeleton-bar card-line"></div>
+              <div class="glance-skeleton-bar card-line short"></div>
+            </div>
+            <div class="glance-preview-card skeleton-card">
+              <div class="glance-skeleton-bar card-title"></div>
+              <div class="glance-skeleton-bar card-line"></div>
+            </div>
+          </div>
+          <div class="glance-preview-col">
+            <div class="glance-preview-card skeleton-card">
+              <div class="glance-skeleton-bar card-title"></div>
+              <div class="glance-skeleton-bar card-line"></div>
+              <div class="glance-skeleton-bar card-line"></div>
+            </div>
+          </div>
+          <div class="glance-preview-col">
+            <div class="glance-preview-card skeleton-card">
+              <div class="glance-skeleton-bar card-title"></div>
+              <div class="glance-skeleton-bar card-line short"></div>
+            </div>
+            <div class="glance-preview-card skeleton-card">
+              <div class="glance-skeleton-bar card-title"></div>
+              <div class="glance-skeleton-bar card-line"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderGlancePreviewHtml(preview, status = "fresh") {
+    if (!preview || !Array.isArray(preview.columns) || preview.columns.length === 0) {
+      return renderGlanceSkeletonHtml();
+    }
+    const staleNotice = status === "stale"
+      ? `<div class="glance-preview-stale-badge">缓存预览 · 正在刷新</div>`
+      : "";
+
+    const columnsHtml = preview.columns.map((col) => {
+      const widgetsHtml = (col.widgets || []).map((w) => {
+        const titleHtml = w.title ? `<div class="glance-card-header">${escapeHtml(w.title)}</div>` : "";
+        const itemsHtml = (w.items || []).map((item) => `
+          <div class="glance-card-item">
+            <span class="glance-card-item-title">${escapeHtml(item.title)}</span>
+          </div>
+        `).join("");
+        return `
+          <div class="glance-preview-card">
+            ${titleHtml}
+            <div class="glance-card-body">${itemsHtml}</div>
+          </div>
+        `;
+      }).join("");
+      return `<div class="glance-preview-col">${widgetsHtml}</div>`;
+    }).join("");
+
+    return `
+      <div class="glance-preview-layout" aria-hidden="true">
+        <div class="glance-preview-header">
+          <div class="glance-preview-title">${escapeHtml(preview.pageTitle || "Glance")}</div>
+          ${staleNotice}
+        </div>
+        <div class="glance-preview-columns">
+          ${columnsHtml}
+        </div>
+      </div>
+    `;
+  }
+
   function extractGlancePreview(rootDocument, targetUrl) {
     if (!rootDocument || typeof rootDocument.querySelectorAll !== "function") {
       return null;
@@ -448,7 +391,7 @@
       const columns = [];
 
       const processWidget = (widgetEl) => {
-        if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i]')) {
+        if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i], input[name*="auth" i], input[type="hidden"], textarea, form')) {
           return null;
         }
 
@@ -513,11 +456,274 @@
     }
   }
 
+  let previewLayer = null;
+  let promptCard = null;
+
+  function ensureLoadingOverlay(settings = null) {
+    if (loadingHost || !document.documentElement) {
+      return;
+    }
+
+    const host = document.createElement("div");
+    host.id = "keep-fnnas-login-loading";
+    const shadow = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { all: initial; }
+      .screen {
+        position: fixed;
+        z-index: 2147483647;
+        inset: 0;
+        overflow: hidden;
+        color: #17243d;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(52,122,240,.15), transparent 34rem),
+          radial-gradient(circle at 82% 86%, rgba(56,198,165,.16), transparent 32rem),
+          #f5f7fb;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        pointer-events: none;
+        user-select: none;
+        box-sizing: border-box;
+      }
+      .screen.dark {
+        color: #f0f4fc;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(52,122,240,.22), transparent 34rem),
+          radial-gradient(circle at 82% 86%, rgba(56,198,165,.13), transparent 32rem),
+          #0e1420;
+      }
+      .preview-layer {
+        width: 100vw;
+        min-height: 100vh;
+        padding: 2.5rem 3.5rem;
+        box-sizing: border-box;
+      }
+      .glance-preview-layout {
+        max-width: 1400px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 1.5rem;
+      }
+      .glance-preview-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.5rem 0;
+      }
+      .glance-preview-title {
+        font-size: 1.75rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .glance-preview-stale-badge {
+        font-size: 0.8rem;
+        font-weight: 500;
+        padding: 0.25rem 0.65rem;
+        border-radius: 9999px;
+        background: rgba(43, 111, 244, 0.12);
+        color: #2b6ff4;
+        border: 1px solid rgba(43, 111, 244, 0.2);
+      }
+      .screen.dark .glance-preview-stale-badge {
+        background: rgba(43, 111, 244, 0.2);
+        color: #8cb3ff;
+      }
+      .glance-preview-columns {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1.5rem;
+        align-items: start;
+      }
+      .glance-preview-col {
+        display: flex;
+        flex-direction: column;
+        gap: 1.25rem;
+      }
+      .glance-preview-card {
+        border: 1px solid rgba(44, 62, 92, 0.1);
+        border-radius: 1rem;
+        background: rgba(255, 255, 255, 0.85);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
+        padding: 1.25rem 1.35rem;
+        backdrop-filter: blur(12px);
+        display: flex;
+        flex-direction: column;
+        gap: 0.85rem;
+      }
+      .screen.dark .glance-preview-card {
+        border-color: rgba(190, 208, 240, 0.1);
+        background: rgba(22, 29, 43, 0.8);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+      }
+      .glance-card-header {
+        font-size: 1.05rem;
+        font-weight: 650;
+        color: #162033;
+      }
+      .screen.dark .glance-card-header {
+        color: #eef3ff;
+      }
+      .glance-card-body {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+      .glance-card-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.35rem 0;
+        border-bottom: 1px solid rgba(44, 62, 92, 0.06);
+        font-size: 0.9rem;
+        color: #4b5870;
+      }
+      .screen.dark .glance-card-item {
+        border-bottom-color: rgba(190, 208, 240, 0.08);
+        color: #aebad0;
+      }
+      .glance-skeleton-bar {
+        background: linear-gradient(90deg, rgba(44, 62, 92, 0.06) 25%, rgba(44, 62, 92, 0.12) 50%, rgba(44, 62, 92, 0.06) 75%);
+        background-size: 200% 100%;
+        animation: shimmer 1.8s infinite;
+        border-radius: 6px;
+      }
+      .screen.dark .glance-skeleton-bar {
+        background: linear-gradient(90deg, rgba(190, 208, 240, 0.06) 25%, rgba(190, 208, 240, 0.12) 50%, rgba(190, 208, 240, 0.06) 75%);
+        background-size: 200% 100%;
+      }
+      .glance-skeleton-title { width: 140px; height: 28px; }
+      .glance-skeleton-time { width: 80px; height: 20px; }
+      .skeleton-card .card-title { width: 50%; height: 18px; margin-bottom: 0.5rem; }
+      .skeleton-card .card-line { width: 90%; height: 14px; }
+      .skeleton-card .card-line.short { width: 60%; }
+      @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+      .card {
+        display: none;
+        width: min(440px, calc(100vw - 44px));
+        margin: 15vh auto 0;
+        padding: 42px 34px 34px;
+        text-align: center;
+        pointer-events: auto;
+      }
+      .animation { position: relative; width: 106px; height: 106px; margin: 0 auto 28px; }
+      .ring { position: absolute; inset: 3px; border: 2px solid rgba(52,122,240,.13); border-top-color: #347af0; border-radius: 50%; animation: spin 1.15s linear infinite; }
+      .ring.secondary { inset: 13px; border-color: rgba(56,198,165,.12); border-right-color: #38c6a5; animation-duration: 1.7s; animation-direction: reverse; }
+      .mark { position: absolute; inset: 24px; display: grid; place-items: center; border-radius: 17px; color: white; background: #347af0; box-shadow: 0 12px 28px rgba(52,122,240,.28); font-size: 25px; font-weight: 850; animation: breathe 1.8s ease-in-out infinite alternate; }
+      h1 { margin: 0; font-size: 22px; letter-spacing: -.02em; }
+      p { min-height: 42px; margin: 10px auto 19px; color: #6f7c92; font-size: 14px; line-height: 1.55; }
+      .screen.dark p { color: #a7b4c9; }
+      .dots { display: flex; justify-content: center; gap: 7px; }
+      .dots i { width: 6px; height: 6px; border-radius: 50%; background: #347af0; animation: dot 1.2s ease-in-out infinite; }
+      .dots i:nth-child(2) { animation-delay: .16s; }
+      .dots i:nth-child(3) { animation-delay: .32s; }
+      button { display: none; min-height: 38px; margin: 23px auto 0; padding: 0 15px; border: 1px solid rgba(52,122,240,.25); border-radius: 9px; color: #285fae; background: rgba(255,255,255,.7); font: 650 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; cursor: pointer; }
+      .screen.dark button { border-color: rgba(140,179,255,.3); color: #c4d8ff; background: rgba(32,44,65,.85); }
+      button.visible { display: block; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes breathe { to { transform: scale(.94); box-shadow: 0 8px 20px rgba(52,122,240,.2); } }
+      @keyframes dot { 0%, 75%, 100% { transform: translateY(0); opacity: .35; } 35% { transform: translateY(-5px); opacity: 1; } }
+      @media (prefers-reduced-motion: reduce) { .ring, .mark, .dots i { animation-duration: 3s; } }
+    `;
+
+    const screen = document.createElement("div");
+    screen.className = `screen${useDarkTheme(settings) ? " dark" : ""}`;
+
+    previewLayer = document.createElement("div");
+    previewLayer.className = "preview-layer";
+    previewLayer.innerHTML = renderGlanceSkeletonHtml();
+
+    promptCard = document.createElement("div");
+    promptCard.className = "card";
+    const animation = document.createElement("div");
+    animation.className = "animation";
+    const ring = document.createElement("span");
+    ring.className = "ring";
+    const secondaryRing = document.createElement("span");
+    secondaryRing.className = "ring secondary";
+    const mark = document.createElement("span");
+    mark.className = "mark";
+    mark.textContent = "G";
+    animation.append(ring, secondaryRing, mark);
+
+    const title = document.createElement("h1");
+    title.textContent = "正在载入 Glance";
+    loadingText = document.createElement("p");
+    loadingText.textContent = "正在检查并恢复 fnOS 登录状态…";
+    const dots = document.createElement("div");
+    dots.className = "dots";
+    dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+    loadingButton = document.createElement("button");
+    loadingButton.type = "button";
+    loadingButton.textContent = "显示 FN Connect / fnOS 页面";
+    loadingButton.addEventListener("click", () => {
+      loadingManuallyDismissed = true;
+      removeLoadingOverlay();
+      setBadge("请在 fnOS 页面完成登录，成功后将自动打开 Glance。");
+    });
+
+    promptCard.append(animation, title, loadingText, dots, loadingButton);
+    screen.append(previewLayer, promptCard);
+    shadow.append(style, screen);
+    host.style.setProperty("all", "initial", "important");
+    document.documentElement.append(host);
+    loadingHost = host;
+
+    // Asynchronously check storage for current location preview to update skeleton into cached preview
+    void (async () => {
+      try {
+        const curKey = previewStorageKey(location.href);
+        const stored = await chrome.storage.local.get([curKey, ACTIVE_PREVIEW_TARGET_KEY]);
+        let preview = stored?.[curKey];
+        if (!preview && stored?.[ACTIVE_PREVIEW_TARGET_KEY]) {
+          const activeKey = previewStorageKey(stored[ACTIVE_PREVIEW_TARGET_KEY]);
+          const activeRes = await chrome.storage.local.get([activeKey]);
+          preview = activeRes?.[activeKey];
+        }
+        if (preview && previewLayer && (!promptCard || promptCard.style.display === "none" || !promptCard.style.display)) {
+          const status = getPreviewStatus(preview);
+          if (status === "fresh" || status === "stale") {
+            if (preview.theme === "dark") {
+              screen.classList.add("dark");
+            } else if (preview.theme === "light") {
+              screen.classList.remove("dark");
+            }
+            previewLayer.innerHTML = renderGlancePreviewHtml(preview, status);
+          }
+        }
+      } catch {
+        // Keep skeleton
+      }
+    })();
+  }
+
+  function setLoading(message, settings, showPageButton = false) {
+    if (loadingManuallyDismissed) {
+      return;
+    }
+    removeBadge();
+    ensureLoadingOverlay(settings);
+    if (previewLayer) {
+      previewLayer.style.display = "none";
+    }
+    if (promptCard) {
+      promptCard.style.display = "block";
+    }
+    if (loadingText) {
+      loadingText.textContent = message;
+    }
+    loadingButton?.classList.toggle("visible", showPageButton);
+  }
+
   function removeLoadingOverlay() {
     loadingHost?.remove();
     loadingHost = null;
     loadingText = null;
     loadingButton = null;
+    previewLayer = null;
+    promptCard = null;
   }
 
   function fadeOutLoadingOverlay(onComplete = null) {
@@ -822,19 +1028,8 @@
       return;
     }
 
-    setLoading("正在检查并恢复 fnOS 登录状态…", settings);
-    await waitForDocument();
-    await new Promise((resolve) => window.setTimeout(resolve, PAGE_SETTLE_MS));
-
-    const initialFailure = pageAuthenticationFailure();
-    if (initialFailure) {
-      setLoading(authenticationFailureMessage(initialFailure), settings);
-      await send({ type: "AUTH_INVALID", reason: initialFailure });
-      return;
-    }
-
     if (pending.phase === "target" && isCurrentPage(pending.targetUrl)) {
-      setLoading("Glance 已响应，正在完成页面渲染…", settings);
+      ensureLoadingOverlay(settings);
       await waitForVisualReady();
       const renderedFailure = pageAuthenticationFailure();
       if (renderedFailure) {
@@ -843,14 +1038,17 @@
         return;
       }
       stopped = true;
-      setLoading("Glance 已就绪。", settings);
       await send({ type: "TARGET_READY" });
 
       try {
         const preview = extractGlancePreview(document, pending.targetUrl);
         if (preview && preview.columns?.length > 0) {
-          const key = `glance-preview:${normalizeNavigableUrl(pending.targetUrl)}`;
-          await chrome.storage.local.set({ [key]: preview });
+          const key = previewStorageKey(pending.targetUrl);
+          const normTarget = normalizeNavigableUrl(pending.targetUrl);
+          await chrome.storage.local.set({
+            [key]: preview,
+            [ACTIVE_PREVIEW_TARGET_KEY]: normTarget
+          });
         }
       } catch {
         // Ignore preview save error
@@ -865,6 +1063,17 @@
         window.requestAnimationFrame(resolve);
       }));
       fadeOutLoadingOverlay();
+      return;
+    }
+
+    setLoading("正在检查并恢复 fnOS 登录状态…", settings);
+    await waitForDocument();
+    await new Promise((resolve) => window.setTimeout(resolve, PAGE_SETTLE_MS));
+
+    const initialFailure = pageAuthenticationFailure();
+    if (initialFailure) {
+      setLoading(authenticationFailureMessage(initialFailure), settings);
+      await send({ type: "AUTH_INVALID", reason: initialFailure });
       return;
     }
 
@@ -1144,6 +1353,11 @@
         ? { ...hello.settings, healthUrl: hello.deviceRoute.healthUrl }
         : hello.settings
     );
+
+    if (!directFailure) {
+      await waitForVisualReady();
+      fadeOutLoadingOverlay();
+    }
   }
 
   chrome.runtime.onMessage.addListener((message) => {
@@ -1156,6 +1370,9 @@
       removeBadge();
     }
   });
+
+  // Synchronously initialize the Preview / Skeleton overlay at document_start
+  ensureLoadingOverlay();
 
   void main();
 })();

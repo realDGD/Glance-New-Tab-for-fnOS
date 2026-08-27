@@ -1,4 +1,5 @@
 import {
+  ACTIVE_PREVIEW_TARGET_KEY,
   extractGlancePreview,
   getPreviewStatus,
   previewStorageKey,
@@ -36,17 +37,33 @@ function showPreview(html) {
 
 async function renderCachedPreviewOrSkeleton() {
   try {
-    const all = await chrome.storage.local.get(null);
+    const activeStored = await chrome.storage.local.get([ACTIVE_PREVIEW_TARGET_KEY]);
+    const activeTarget = activeStored?.[ACTIVE_PREVIEW_TARGET_KEY];
     let foundPreview = null;
     let foundStatus = "none";
 
-    for (const [key, value] of Object.entries(all || {})) {
-      if (key.startsWith("glance-preview:") && value && typeof value === "object") {
-        const status = getPreviewStatus(value);
-        if (status === "fresh" || (status === "stale" && !foundPreview)) {
-          foundPreview = value;
+    if (activeTarget) {
+      const activeKey = previewStorageKey(activeTarget);
+      const res = await chrome.storage.local.get([activeKey]);
+      if (res?.[activeKey]) {
+        const status = getPreviewStatus(res[activeKey]);
+        if (status === "fresh" || status === "stale") {
+          foundPreview = res[activeKey];
           foundStatus = status;
-          if (status === "fresh") break;
+        }
+      }
+    }
+
+    if (!foundPreview) {
+      const all = await chrome.storage.local.get(null);
+      for (const [key, value] of Object.entries(all || {})) {
+        if (key.startsWith("glance-preview:") && value && typeof value === "object") {
+          const status = getPreviewStatus(value);
+          if (status === "fresh" || (status === "stale" && !foundPreview)) {
+            foundPreview = value;
+            foundStatus = status;
+            if (status === "fresh") break;
+          }
         }
       }
     }
