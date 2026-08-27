@@ -1169,6 +1169,11 @@ async function handleCompletedBootstrapNavigation(tabId, tabUrl) {
     }
 
     const isRoot = isConfiguredRootOrigin(pending, tabUrl);
+    if (isRoot) {
+      await completeDockerBootstrap(tabId, tabUrl, false, navContext.navigationId);
+      return;
+    }
+
     const completion = await completeDockerBootstrap(tabId, tabUrl, true, navContext.navigationId);
     if (completion.action !== "bootstrap-complete") {
       return;
@@ -1176,7 +1181,7 @@ async function handleCompletedBootstrapNavigation(tabId, tabUrl) {
     await navigateToTarget(
       tabId,
       completion.pending,
-      isRoot ? "official-bootstrap-root-complete" : "official-bootstrap-external-route",
+      "official-bootstrap-external-route",
       navContext.navigationId
     );
   });
@@ -1318,15 +1323,6 @@ async function handleMessage(message, sender) {
           return { action: "ignored", pending };
         }
         const completion = await completeDockerBootstrap(senderTabId, sender.url, false, navContext.navigationId);
-        if (completion.action === "bootstrap-complete") {
-          await navigateToTarget(
-            senderTabId,
-            completion.pending,
-            "bootstrap-complete-message",
-            navContext.navigationId
-          );
-          return { action: "navigating", pending: completion.pending };
-        }
         return completion;
       }
     );

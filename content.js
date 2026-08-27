@@ -746,10 +746,6 @@
       }
 
       const completion = await send({ type: "BOOTSTRAP_COMPLETE" });
-      if (completion?.action === "navigating") {
-        stopped = true;
-        return;
-      }
       if (completion?.pending) {
         pending = completion.pending;
       }
@@ -821,9 +817,11 @@
         ? DOCKER_BOOTSTRAP_FALLBACK_GRACE_MS
         : DOCKER_FALLBACK_GRACE_MS
       : ROOT_GRACE_MS;
-    const fallbackTimer = window.setTimeout(() => {
-      void tryTargetAfterGrace();
-    }, Math.max(0, fallbackGraceMs - rootElapsedAtStart));
+    const fallbackTimer = !dockerRecovery
+      ? window.setTimeout(() => {
+          void tryTargetAfterGrace();
+        }, Math.max(0, fallbackGraceMs - rootElapsedAtStart))
+      : null;
 
     async function tick() {
       if (stopped) {
@@ -922,9 +920,11 @@
         );
       }
 
-      const rootElapsed = Date.now() - Number(pending.rootEnteredAt ?? Date.now());
-      if (rootElapsed >= fallbackGraceMs) {
-        await tryTargetAfterGrace();
+      if (!dockerRecovery) {
+        const rootElapsed = Date.now() - Number(pending.rootEnteredAt ?? Date.now());
+        if (rootElapsed >= fallbackGraceMs) {
+          await tryTargetAfterGrace();
+        }
       }
     }
 
