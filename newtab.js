@@ -38,7 +38,16 @@ async function start() {
     return;
   }
 
-  if (response?.action === "recovering-startup") {
+  if (response?.action === "waiting-warmup") {
+    statusElement.textContent = "正在等待 FN Connect 后台预热完成…";
+    const storageListener = (changes, areaName) => {
+      if (areaName === "session" && changes["browser-session-warmed"]?.newValue) {
+        chrome.storage.onChanged?.removeListener(storageListener);
+        void start().catch(() => null);
+      }
+    };
+    chrome.storage.onChanged?.addListener(storageListener);
+  } else if (response?.action === "recovering-startup") {
     statusElement.textContent = "正在确认 fnOS 登录状态并恢复主页…";
   } else if (response?.action === "checking-target") {
     statusElement.textContent = "正在连接 Glance…";

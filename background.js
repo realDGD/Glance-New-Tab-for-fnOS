@@ -62,20 +62,6 @@ void warmupManager.rehydrate((url) => probeAuth(url)).catch((error) => {
   console.error("Failed to rehydrate warmup manager:", error);
 });
 
-chrome.runtime.onStartup?.addListener(() => {
-  void (async () => {
-    const settings = await loadSettings();
-    if (
-      settings.setupCompleted
-      && settings.enabled
-      && settings.fnosRecoveryEnabled
-      && isFnOsUrl(settings.targetUrl)
-    ) {
-      await warmupManager.startWarmup(settings, "startup", (url) => probeAuth(url));
-    }
-  })();
-});
-
 function routeKey(targetUrl) {
   return normalizeNavigableUrl(targetUrl);
 }
@@ -686,19 +672,11 @@ async function openConfiguredPage(tabId, source = "new-tab", explicitNavigationI
     return { action: "checking-target", themeMode: settings.themeMode };
   }
 
-  // 3. If warmup is in-flight in background, wait/subscribe to it!
+  // 3. If warmup is in-flight in background, dispatch continuation and return waiting-warmup immediately!
   if (warmupManager.isWarming()) {
     console.debug?.(`[FNOS prewarm] New Tab (tab ${tabId}, nav ${navigationId}) waiting for in-flight warmup`);
-    const warmupResult = await warmupManager.waitForWarmup(tabId, navigationId, settings, MAX_NEWTAB_WARMUP_WAIT_MS);
-    if (!tabNavigations.isActive(tabId, navigationId)) {
-      return { action: "cancelled", themeMode: settings.themeMode };
-    }
-    if (warmupResult.warmed) {
-      await beginTargetFirst(tabId, settings, `${source}-warmup-ready`, navigationId);
-      return { action: "checking-target", themeMode: settings.themeMode };
-    }
-    console.debug?.(`[FNOS prewarm] In-flight warmup timed out/failed (${warmupResult.reason}), taking over foreground recovery`);
-    await warmupManager.cancelWarmup("takeover-timeout");
+    void continueAfterWarmup({ tabId, navigationId, settings, source });
+    return { action: "waiting-warmup", themeMode: settings.themeMode, settings };
   }
 
   if (!tabNavigations.isActive(tabId, navigationId)) {
@@ -708,6 +686,41 @@ async function openConfiguredPage(tabId, source = "new-tab", explicitNavigationI
   await markSessionWarmed();
   await beginRecovery(tabId, settings, `${source}-cold-start`, navigationId);
   return { action: "recovering-startup", themeMode: settings.themeMode };
+}
+
+async function continueAfterWarmup({ tabId, navigationId, settings, source }) {
+  try {
+    const warmupResult = await warmupManager.waitForWarmup(
+      tabId,
+      navigationId,
+      settings,
+      MAX_NEWTAB_WARMUP_WAIT_MS
+    );
+
+    if (!tabNavigations.isActive(tabId, navigationId)) {
+      return;
+    }
+
+    if (warmupResult.warmed) {
+      console.debug?.(`[FNOS prewarm] Warmup ready, navigating tab ${tabId} (nav ${navigationId}) target-first`);
+      await beginTargetFirst(tabId, settings, `${source}-warmup-ready`, navigationId);
+      return;
+    }
+
+    console.debug?.(
+      `[FNOS prewarm] In-flight warmup timed out/failed (${warmupResult.reason}), taking over foreground recovery on tab ${tabId}`
+    );
+    await warmupManager.cancelWarmup("takeover-timeout");
+
+    if (!tabNavigations.isActive(tabId, navigationId)) {
+      return;
+    }
+
+    await markSessionWarmed();
+    await beginRecovery(tabId, settings, `${source}-warmup-failed-takeover`, navigationId);
+  } catch (error) {
+    console.error(`[FNOS prewarm] Error in continueAfterWarmup for tab ${tabId}:`, error);
+  }
 }
 
 async function navigateToTarget(tabId, pending, reason, explicitNavigationId = null) {
@@ -1721,28 +1734,32 @@ chrome.runtime.onInstalled.addListener(() => {
     });
 });
 
+async function handleRuntimeStartup() {
+  try {
+    await ensureInstalledDefaults(false);
+    await restoreLanContentScripts();
+  } catch (error) {
+    console.error("Failed to restore LAN content scripts on startup:", error);
+  }
+  try {
+    const settings = await loadSettings();
+    if (
+      settings.setupCompleted
+      && settings.enabled
+      && settings.fnosRecoveryEnabled
+      && isFnOsUrl(settings.targetUrl)
+    ) {
+      await warmupManager.startWarmup(settings, "startup", (url) => probeAuth(url));
+    }
+  } catch (error) {
+    console.error("Failed to start FN Connect warmup on startup:", error);
+  }
+}
+
 chrome.runtime.onStartup.addListener(() => {
-  void (async () => {
-    try {
-      await ensureInstalledDefaults(false);
-      await restoreLanContentScripts();
-    } catch (error) {
-      console.error("Failed to restore LAN content scripts on startup:", error);
-    }
-    try {
-      const settings = await loadSettings();
-      if (
-        settings.setupCompleted
-        && settings.enabled
-        && settings.fnosRecoveryEnabled
-        && isFnOsUrl(settings.targetUrl)
-      ) {
-        await warmupManager.startWarmup(settings, "startup", (url) => probeAuth(url));
-      }
-    } catch (error) {
-      console.error("Failed to start FN Connect warmup on startup:", error);
-    }
-  })();
+  void handleRuntimeStartup().catch((error) => {
+    console.error("Uncaught startup error in background:", error);
+  });
 });
 
 chrome.action.onClicked.addListener(() => {

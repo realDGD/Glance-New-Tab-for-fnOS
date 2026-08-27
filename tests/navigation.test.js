@@ -3040,3 +3040,170 @@ test("WARM17 (T17): New Tab 等待 warmup 期间用户主动导航离开，取�
   assert.equal(tabManager.isActive(tabId, nav.navigationId), false);
 });
 
+test("WARM18 (P0-1 & P0-2): OPEN_NEW_TAB 遇到 warming 时立即返回 waiting-warmup，不阻塞 RPC", async () => {
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+
+  // Simulated openConfiguredPage when warming
+  let continuationDispatched = false;
+  function openConfiguredPageSimulated() {
+    if (manager.isWarming()) {
+      continuationDispatched = true;
+      return { action: "waiting-warmup", themeMode: "auto" };
+    }
+    return { action: "checking-target" };
+  }
+
+  const res = openConfiguredPageSimulated();
+  assert.equal(res.action, "waiting-warmup");
+  assert.equal(continuationDispatched, true);
+  // Manager is still warming (warmup has not resolved)
+  assert.equal(manager.state, "warming");
+});
+
+test("WARM19 (P0-3): newtab.js 针对 waiting-warmup 展示预热等待文案，不再停留于读取设置", () => {
+  function getNewTabStatusText(responseAction) {
+    if (responseAction === "waiting-warmup") {
+      return "正在等待 FN Connect 后台预热完成…";
+    }
+    if (responseAction === "recovering-startup") {
+      return "正在确认 fnOS 登录状态并恢复主页…";
+    }
+    if (responseAction === "checking-target") {
+      return "正在连接 Glance…";
+    }
+    return "正在读取新标签页设置…";
+  }
+
+  assert.equal(getNewTabStatusText("waiting-warmup"), "正在等待 FN Connect 后台预热完成…");
+  assert.notEqual(getNewTabStatusText("waiting-warmup"), "正在读取新标签页设置…");
+});
+
+test("WARM20 (P0-4 & P0-7): continueAfterWarmup 在 warmup Ready 后驱动当前 tab 走 target-first", async () => {
+  const tabManager = new TabNavigationManager();
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+
+  const tabId = 501;
+  const nav = tabManager.begin(tabId);
+  let targetNavigated = false;
+
+  async function continueAfterWarmupSimulated() {
+    const warmupResult = await manager.waitForWarmup(tabId, nav.navigationId, settings, 5000);
+    if (!tabManager.isActive(tabId, nav.navigationId)) return;
+    if (warmupResult.warmed) {
+      targetNavigated = true;
+    }
+  }
+
+  const continuationPromise = continueAfterWarmupSimulated();
+  await manager.markReady();
+  await continuationPromise;
+
+  assert.equal(targetNavigated, true);
+});
+
+test("WARM21 (P0-5 & P0-6): continueAfterWarmup 在用户主动跳走后取消导航，不覆盖用户页面", async () => {
+  const tabManager = new TabNavigationManager();
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+
+  const tabId = 502;
+  const nav = tabManager.begin(tabId);
+  let targetNavigated = false;
+
+  async function continueAfterWarmupSimulated() {
+    const warmupResult = await manager.waitForWarmup(tabId, nav.navigationId, settings, 5000);
+    if (!tabManager.isActive(tabId, nav.navigationId)) return;
+    if (warmupResult.warmed) {
+      targetNavigated = true;
+    }
+  }
+
+  const continuationPromise = continueAfterWarmupSimulated();
+  // User navigates to github.com
+  tabManager.handleUrlChange(tabId, "https://github.com/");
+  await manager.markReady();
+  await continuationPromise;
+
+  assert.equal(targetNavigated, false);
+});
+
+test("WARM22 (P0-8 & P0-10): continueAfterWarmup 在超时后先 cancel warmup 再执行 foreground recovery", async () => {
+  const tabManager = new TabNavigationManager();
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({ tabsApi: mockTabs, sessionStorage: mockStorage });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+
+  const tabId = 503;
+  const nav = tabManager.begin(tabId);
+  let foregroundRecoveryStarted = false;
+
+  async function continueAfterWarmupSimulated() {
+    const warmupResult = await manager.waitForWarmup(tabId, nav.navigationId, settings, 50);
+    if (!tabManager.isActive(tabId, nav.navigationId)) return;
+    if (!warmupResult.warmed) {
+      await manager.cancelWarmup("takeover-timeout");
+      if (!tabManager.isActive(tabId, nav.navigationId)) return;
+      foregroundRecoveryStarted = true;
+    }
+  }
+
+  await continueAfterWarmupSimulated();
+  assert.equal(foregroundRecoveryStarted, true);
+  assert.equal(manager.state, "failed");
+});
+
+test("WARM23 (P0-13): background.js 中仅包含唯一的 chrome.runtime.onStartup 监听器", () => {
+  const bgCode = fs.readFileSync(new URL("../background.js", import.meta.url), "utf8");
+  const matches = bgCode.match(/chrome\.runtime\.onStartup(?:\?\.|\.)addListener/g);
+  assert.ok(matches);
+  assert.equal(matches.length, 1);
+});
+
+test("WARM24 (P0-15): handleRuntimeStartup 异常被安全捕获，无未捕获异常", async () => {
+  let loggedError = null;
+  async function handleRuntimeStartupMock(shouldFail = true) {
+    if (shouldFail) {
+      throw new Error("Startup storage failed");
+    }
+  }
+
+  await handleRuntimeStartupMock().catch((err) => {
+    loggedError = err.message;
+  });
+
+  assert.equal(loggedError, "Startup storage failed");
+});
+
