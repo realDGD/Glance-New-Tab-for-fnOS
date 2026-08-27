@@ -14,7 +14,9 @@ import {
   sanitizeSettings,
   chooseInitialNavigation,
   parsePendingEnvelope,
-  NavigationPersistence
+  NavigationPersistence,
+  OwnedTabController,
+  LanRouteStore
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -659,7 +661,7 @@ test("P1.10: Restarted worker with new generation N+1 rejects stale events from 
   assert.equal(manager.getAbortSignal(tabId, 2)?.aborted, false);
 });
 
-test("P0-1 & P0-6: NavigationPersistence per-generation keys eliminate TOCTOU interleaving", async () => {
+test("P0-1 & P2-1.A: NavigationPersistence without shared pointer eliminates TOCTOU interleaving", async () => {
   const store = new Map();
   let deferredRemove = null;
 
@@ -695,12 +697,11 @@ test("P0-1 & P0-6: NavigationPersistence per-generation keys eliminate TOCTOU in
   // Generation 1 sets pending
   await persistence.setPendingEnvelope(tabId, 1, {
     generation: 1,
-    pending: { phase: "bootstrap", targetUrl: "https://v1.example.com/" }
+    pending: { phase: "bootstrap", targetUrl: "https://v1.example.com/" },
+    savedAt: 1000
   });
   assert.ok(store.has(`pending-recovery:${tabId}:1`));
-  assert.equal(store.get(`nav-active:${tabId}`)?.generation, 1);
 
-  // Simulate TOCTOU Interleaving:
   // Gen 1 begins removal and gets delayed during remove execution
   let resolveRemove;
   deferredRemove = new Promise((resolve) => { resolveRemove = resolve; });
@@ -710,10 +711,10 @@ test("P0-1 & P0-6: NavigationPersistence per-generation keys eliminate TOCTOU in
   // In the meantime, Generation 2 starts and writes its state!
   await persistence.setPendingEnvelope(tabId, 2, {
     generation: 2,
-    pending: { phase: "target", targetUrl: "https://v2.example.com/" }
+    pending: { phase: "target", targetUrl: "https://v2.example.com/" },
+    savedAt: 2000
   });
   assert.ok(store.has(`pending-recovery:${tabId}:2`));
-  assert.equal(store.get(`nav-active:${tabId}`)?.generation, 2);
 
   // Now Generation 1's delayed remove completes
   resolveRemove();
@@ -722,7 +723,6 @@ test("P0-1 & P0-6: NavigationPersistence per-generation keys eliminate TOCTOU in
 
   // ASSERTION: Generation 2's key MUST still be in store!
   assert.equal(store.has(`pending-recovery:${tabId}:2`), true);
-  assert.equal(store.get(`nav-active:${tabId}`)?.generation, 2);
   const gen2Loaded = await persistence.getPendingEnvelope(tabId);
   assert.equal(gen2Loaded?.generation, 2);
   assert.equal(gen2Loaded?.pending?.targetUrl, "https://v2.example.com/");
@@ -730,7 +730,153 @@ test("P0-1 & P0-6: NavigationPersistence per-generation keys eliminate TOCTOU in
   assert.equal(store.has(`pending-recovery:${tabId}:1`), false);
 });
 
-test("P0-3 & P0-5: LAN discovery ownership binding prevents stale probe from affecting generation N+1", async () => {
+test("P0-2 & P2-1.B: OwnedTabController prevents await race closing newer generation or user tab", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 501;
+  const gen1 = manager.begin(tabId);
+  manager.setExpectedUrl(tabId, gen1, "https://5ddd.com/nas-demo/");
+  manager.setPending(tabId, { phase: "bootstrap", targetUrl: "https://service.5ddd.com/" }, gen1);
+
+  let deferredTabsGet = null;
+  let tabsRemoveCalls = [];
+
+  const mockTabs = {
+    async get(id) {
+      if (deferredTabsGet) {
+        await deferredTabsGet;
+      }
+      return { id, url: "https://5ddd.com/nas-demo/" };
+    },
+    async remove(id) {
+      tabsRemoveCalls.push(id);
+    }
+  };
+
+  const controller = new OwnedTabController(manager, null, mockTabs);
+
+  // Scenario 1: Gen 1 calls removeOwnedTab, gets delayed in await tabs.get
+  let resolveTabsGet;
+  deferredTabsGet = new Promise((resolve) => { resolveTabsGet = resolve; });
+
+  const removePromise = controller.removeOwnedTab(tabId, gen1, "test-race");
+
+  // While paused, Generation 2 begins on the tab!
+  const gen2 = manager.begin(tabId);
+  assert.equal(gen2, 2);
+  assert.equal(manager.isActive(tabId, gen1), false);
+
+  // Now tabs.get resolves for Gen 1
+  resolveTabsGet();
+  const removeResult = await removePromise;
+  deferredTabsGet = null;
+
+  // Gen 1 removal MUST fail and NOT call tabs.remove!
+  assert.equal(removeResult.ok, false);
+  assert.equal(removeResult.reason, "stale-generation");
+  assert.equal(tabsRemoveCalls.length, 0);
+  assert.equal(manager.isActive(tabId, gen2), true);
+
+  // Scenario 2: User navigated to external site (github.com)
+  const tabId2 = 502;
+  const genA = manager.begin(tabId2);
+  manager.setExpectedUrl(tabId2, genA, "https://5ddd.com/nas-demo/");
+
+  const userNavTabs = {
+    async get(id) {
+      return { id, url: "https://github.com/trending" };
+    },
+    async remove(id) {
+      tabsRemoveCalls.push(id);
+    }
+  };
+
+  const controller2 = new OwnedTabController(manager, null, userNavTabs);
+  const userNavResult = await controller2.removeOwnedTab(tabId2, genA, "close-desktop");
+  assert.equal(userNavResult.ok, false);
+  assert.equal(userNavResult.reason, "user-navigated-away");
+  assert.equal(tabsRemoveCalls.length, 0);
+  assert.equal(manager.isActive(tabId2, genA), false);
+
+  // Scenario 3: Valid owned tab on expected URL -> successfully closed
+  const tabId3 = 503;
+  const genB = manager.begin(tabId3);
+  manager.setExpectedUrl(tabId3, genB, "https://5ddd.com/nas-demo/");
+
+  const validTabs = {
+    async get(id) {
+      return { id, url: "https://5ddd.com/nas-demo/" };
+    },
+    async remove(id) {
+      tabsRemoveCalls.push(id);
+    }
+  };
+
+  const controller3 = new OwnedTabController(manager, null, validTabs);
+  const successResult = await controller3.removeOwnedTab(tabId3, genB, "valid-close");
+  assert.equal(successResult.ok, true);
+  assert.equal(tabsRemoveCalls.includes(tabId3), true);
+  assert.equal(manager.isActive(tabId3, genB), false);
+});
+
+test("P0-3 & P2-1.C: LanRouteStore drops stale route write when generation is cancelled during await", async () => {
+  const store = new Map();
+  let deferredStorageGet = null;
+
+  const mockStorage = {
+    async get(key) {
+      if (deferredStorageGet) {
+        await deferredStorageGet;
+      }
+      return { [key]: store.get(key) || {} };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) {
+        store.set(k, v);
+      }
+    }
+  };
+
+  const manager = new TabNavigationManager();
+  const routeStore = new LanRouteStore(manager, mockStorage);
+  const ownerTabId = 601;
+  const gen1 = manager.begin(ownerTabId);
+
+  // Gen 1 starts saveRoute but gets delayed in await loadRoutes()
+  let resolveGet;
+  deferredStorageGet = new Promise((resolve) => { resolveGet = resolve; });
+
+  const staleRoutePromise = routeStore.saveRoute(
+    "https://service.remote.fnos.net/",
+    { kind: "docker", targetUrl: "http://192.168.1.10:8080/" },
+    ownerTabId,
+    gen1
+  );
+
+  // Clear deferredStorageGet so Gen 2 runs without blocking
+  const gen1Resolve = resolveGet;
+  deferredStorageGet = null;
+
+  // User navigates / starts Gen 2 on owner tab, which saves a new route!
+  const gen2 = manager.begin(ownerTabId);
+  const gen2Store = new LanRouteStore(manager, mockStorage);
+  await gen2Store.saveRoute(
+    "https://service.remote.fnos.net/",
+    { kind: "docker", targetUrl: "http://192.168.1.99:9000/" },
+    ownerTabId,
+    gen2
+  );
+
+  // Now Gen 1 resumes
+  gen1Resolve();
+  const staleResult = await staleRoutePromise;
+
+  // Stale result MUST be null and MUST NOT overwrite Gen 2's route!
+  assert.equal(staleResult, null);
+  const activeRoute = await routeStore.getRoute("https://service.remote.fnos.net/");
+  assert.equal(activeRoute.targetUrl, "http://192.168.1.99:9000/");
+});
+
+test("P1-3 & P2-1.E: LAN discovery rehydration resumes discovery on valid tab and purges on invalid tab", async () => {
   const store = new Map();
   const mockStorage = {
     async get(keys) {
@@ -748,102 +894,111 @@ test("P0-3 & P0-5: LAN discovery ownership binding prevents stale probe from aff
   };
 
   const persistence = new NavigationPersistence(mockStorage);
-  const manager = new TabNavigationManager();
-  const tabId = 402;
+  const ownerTabId = 701;
+  const gen = 1;
 
-  // Generation 1 starts Docker LAN discovery
-  const gen1 = manager.begin(tabId);
-  await persistence.setDiscovery(tabId, gen1, {
-    remoteTargetUrl: "https://remote.example.com/",
+  // Persist pending and discovery before SW restart
+  await persistence.setPendingEnvelope(ownerTabId, gen, {
+    generation: gen,
+    expectedUrl: "http://192.168.1.50:8080/",
+    expectedUrls: ["http://192.168.1.50:8080/"],
+    pending: {
+      phase: "lan-discovery",
+      targetUrl: "https://remote.5ddd.com/",
+      lanRootUrl: "http://192.168.1.50:8080/"
+    },
+    savedAt: Date.now()
+  });
+  await persistence.setDiscovery(ownerTabId, gen, {
+    remoteTargetUrl: "https://remote.5ddd.com/",
     lanRootUrl: "http://192.168.1.50:8080/",
     startedAt: Date.now(),
     expiresAt: Date.now() + 60000
   });
-  assert.ok(store.has(`lan-discovery:${tabId}:${gen1}`));
 
-  // In-flight probe begins for Gen 1
-  let probeResolved = false;
-  let staleRouteCommitted = false;
-  const delayedProbe = new Promise((resolve) => {
-    setTimeout(async () => {
-      probeResolved = true;
-      // Stale callback checks ownership before committing
-      if (manager.isActive(tabId, gen1)) {
-        staleRouteCommitted = true;
-      }
-      resolve();
-    }, 25);
+  // SW restarts: new empty TabNavigationManager
+  const newManager = new TabNavigationManager();
+  assert.equal(newManager.isActive(ownerTabId), false);
+
+  // Case 1: Tab is still on valid discovery URL -> rehydration succeeds!
+  const validEnvelope = await persistence.getPendingEnvelope(ownerTabId);
+  const rehydrated = newManager.rehydrate(ownerTabId, validEnvelope);
+  assert.ok(rehydrated);
+  assert.equal(newManager.isActive(ownerTabId, gen), true);
+
+  // Case 2: User navigated to external URL -> purge stale discovery
+  const ownerTabId2 = 702;
+  await persistence.setDiscovery(ownerTabId2, 1, {
+    remoteTargetUrl: "https://remote2.5ddd.com/",
+    lanRootUrl: "http://192.168.1.60:8080/",
+    startedAt: Date.now(),
+    expiresAt: Date.now() + 60000
   });
 
-  // User navigates / starts Generation 2 on the tab
-  const gen2 = manager.begin(tabId);
-  assert.equal(gen2, 2);
-  assert.equal(manager.isActive(tabId, gen1), false);
-  await persistence.setPendingEnvelope(tabId, gen2, {
-    generation: 2,
-    pending: { phase: "target", targetUrl: "https://new.example.com/" }
-  });
-
-  // Wait for Gen 1 probe to resolve
-  await delayedProbe;
-  assert.equal(probeResolved, true);
-  assert.equal(staleRouteCommitted, false);
-
-  // Gen 1 cleanup only deletes its own discovery
-  await persistence.removeDiscovery(tabId, gen1);
-  assert.equal(store.has(`lan-discovery:${tabId}:${gen1}`), false);
-  // Gen 2 pending is untouched
-  assert.equal(store.has(`pending-recovery:${tabId}:${gen2}`), true);
-});
-
-test("P0-4: removeOwnedTab guards ownership and prevents closing user-navigated tabs", async () => {
-  const manager = new TabNavigationManager();
-  const tabId = 403;
-  const gen = manager.begin(tabId);
-  manager.setExpectedUrl(tabId, gen, "https://5ddd.com/demo-nas/");
-  manager.setPending(tabId, { phase: "bootstrap", targetUrl: "https://service.demo.5ddd.com/" }, gen);
-
-  let chromeTabsRemoveCalled = false;
-  async function mockRemoveOwnedTab(id, generation, currentUrl) {
-    if (!manager.isActive(id, generation)) {
-      return { ok: false, reason: "stale-generation" };
+  // Verification helper mimicking ensureNavigationContext on user navigation
+  async function mockEnsureOrPurge(tabId, currentTabUrl) {
+    const envelope = await persistence.getPendingEnvelope(tabId);
+    if (!envelope) {
+      await persistence.removeDiscovery(tabId);
+      return null;
     }
-    const state = manager.get(id);
-    const allowedUrls = state ? state.expectedUrls : new Set();
-    const isAllowed = isIgnoredNavigationUrl(currentUrl)
-      || matchesExpectedNavigation(allowedUrls, state?.pending, currentUrl, state?.expectedUrl);
-
-    if (!isAllowed) {
-      manager.cancel(id, "user-navigated-away", generation);
-      return { ok: false, reason: "user-navigated-away" };
+    const allowed = new Set(envelope.expectedUrls || []);
+    if (!matchesExpectedNavigation(allowed, envelope.pending, currentTabUrl, envelope.expectedUrl)) {
+      await persistence.removePendingEnvelope(tabId, envelope.generation);
+      await persistence.removeDiscovery(tabId, envelope.generation);
+      return null;
     }
-    manager.cancel(id, "close-owned-tab", generation);
-    chromeTabsRemoveCalled = true;
-    return { ok: true };
+    return newManager.rehydrate(tabId, envelope);
   }
 
-  // Case 1: Stale generation cannot close tab
-  const staleRes = await mockRemoveOwnedTab(tabId, 999, "https://5ddd.com/demo-nas/");
-  assert.equal(staleRes.ok, false);
-  assert.equal(staleRes.reason, "stale-generation");
-  assert.equal(chromeTabsRemoveCalled, false);
+  const context = await mockEnsureOrPurge(ownerTabId2, "https://www.google.com/");
+  assert.equal(context, null);
+  assert.equal(await persistence.getDiscovery(ownerTabId2), null);
+});
 
-  // Case 2: User navigated to external site (github.com) -> refuse to close tab!
-  const userNavRes = await mockRemoveOwnedTab(tabId, gen, "https://github.com/trending");
-  assert.equal(userNavRes.ok, false);
-  assert.equal(userNavRes.reason, "user-navigated-away");
-  assert.equal(chromeTabsRemoveCalled, false);
-  assert.equal(manager.isActive(tabId, gen), false);
+test("P1-4 & P2-1.F: removeAllForTab purges all generations of pending and discovery for removed tab", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
+    }
+  };
 
-  // Case 3: Legitimate owned tab on recovery URL -> successfully closed
-  const tabId2 = 404;
-  const gen2 = manager.begin(tabId2);
-  manager.setExpectedUrl(tabId2, gen2, "https://demo-nas.5ddd.com/");
-  manager.setPending(tabId2, { phase: "root" }, gen2);
-  const successRes = await mockRemoveOwnedTab(tabId2, gen2, "https://demo-nas.5ddd.com/");
-  assert.equal(successRes.ok, true);
-  assert.equal(chromeTabsRemoveCalled, true);
-  assert.equal(manager.isActive(tabId2, gen2), false);
+  const persistence = new NavigationPersistence(mockStorage);
+  const tabId1 = 801;
+  const tabId2 = 802;
+
+  // Add multiple generations for tab 801
+  await persistence.setPendingEnvelope(tabId1, 1, { generation: 1, pending: { phase: "root" } });
+  await persistence.setPendingEnvelope(tabId1, 2, { generation: 2, pending: { phase: "target" } });
+  await persistence.setDiscovery(tabId1, 1, { expiresAt: Date.now() + 60000 });
+  await persistence.setDiscovery(tabId1, 2, { expiresAt: Date.now() + 60000 });
+
+  // Add data for tab 802
+  await persistence.setPendingEnvelope(tabId2, 1, { generation: 1, pending: { phase: "target" } });
+  await persistence.setDiscovery(tabId2, 1, { expiresAt: Date.now() + 60000 });
+
+  // Tab 801 is removed
+  await persistence.removeAllForTab(tabId1);
+
+  // Tab 801 data is completely removed
+  assert.equal(store.has(`pending-recovery:${tabId1}:1`), false);
+  assert.equal(store.has(`pending-recovery:${tabId1}:2`), false);
+  assert.equal(store.has(`lan-discovery:${tabId1}:1`), false);
+  assert.equal(store.has(`lan-discovery:${tabId1}:2`), false);
+
+  // Tab 802 data is completely untouched
+  assert.equal(store.has(`pending-recovery:${tabId2}:1`), true);
+  assert.equal(store.has(`lan-discovery:${tabId2}:1`), true);
 });
 
 

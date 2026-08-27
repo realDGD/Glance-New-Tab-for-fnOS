@@ -18,9 +18,11 @@ import {
   isBootstrapTransitUrl,
   isConfiguredRootOrigin,
   isConfiguredTargetPage,
+  LanRouteStore,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
   NavigationPersistence,
   normalizeNavigableUrl,
+  OwnedTabController,
   parsePendingEnvelope,
   sanitizeSettings,
   shouldStopDockerRecovery,
@@ -41,6 +43,8 @@ let sessionClaimQueue = Promise.resolve();
 const tabTransitionQueues = new Map();
 const tabNavigations = new TabNavigationManager();
 const navPersistence = new NavigationPersistence();
+const lanRouteStore = new LanRouteStore(tabNavigations);
+const ownedTabController = new OwnedTabController(tabNavigations, navPersistence);
 const registeredScriptPatterns = new Set();
 
 void restoreLanContentScripts();
@@ -50,35 +54,19 @@ function routeKey(targetUrl) {
 }
 
 async function loadLanRoutes() {
-  const stored = await chrome.storage.local.get(LAN_ROUTES_KEY);
-  const routes = stored[LAN_ROUTES_KEY];
-  return routes && typeof routes === "object" ? routes : {};
+  return lanRouteStore.loadRoutes();
 }
 
 async function getLanRoute(targetUrl) {
-  if (!targetUrl) {
-    return null;
-  }
-  const routes = await loadLanRoutes();
-  return routes[routeKey(targetUrl)] ?? null;
+  return lanRouteStore.getRoute(targetUrl);
 }
 
-async function saveLanRoute(remoteTargetUrl, route) {
-  const routes = await loadLanRoutes();
-  routes[routeKey(remoteTargetUrl)] = {
-    ...route,
-    remoteTargetUrl: routeKey(remoteTargetUrl),
-    learnedAt: Date.now()
-  };
-  await chrome.storage.local.set({ [LAN_ROUTES_KEY]: routes });
-  await chrome.storage.session.remove(lanUnreachableKey(remoteTargetUrl));
-  return routes[routeKey(remoteTargetUrl)];
+async function saveLanRoute(remoteTargetUrl, route, ownerTabId = null, generation = null) {
+  return lanRouteStore.saveRoute(remoteTargetUrl, route, ownerTabId, generation);
 }
 
 async function removeLanRoute(remoteTargetUrl) {
-  const routes = await loadLanRoutes();
-  delete routes[routeKey(remoteTargetUrl)];
-  await chrome.storage.local.set({ [LAN_ROUTES_KEY]: routes });
+  return lanRouteStore.removeRoute(remoteTargetUrl);
 }
 
 function lanUnreachableKey(targetUrl) {
@@ -349,48 +337,8 @@ async function navigateOwnedTab(tabId, generation, url, options = {}) {
 }
 
 async function removeOwnedTab(tabId, generation, reason = "close-owned-tab") {
-  if (!Number.isInteger(tabId) || !Number.isInteger(generation)) {
-    return { ok: false, reason: "invalid-params" };
-  }
-
-  if (!tabNavigations.isActive(tabId, generation)) {
-    return { ok: false, reason: "stale-generation" };
-  }
-
-  let currentTab;
-  try {
-    currentTab = await chrome.tabs.get(tabId);
-  } catch {
-    await cancelNavigation(tabId, reason, generation);
-    return { ok: false, reason: "tab-not-found" };
-  }
-
-  if (typeof currentTab?.url !== "string") {
-    await cancelNavigation(tabId, reason, generation);
-    return { ok: false, reason: "invalid-tab-url" };
-  }
-
-  const state = tabNavigations.get(tabId);
-  const allowedUrls = state ? state.expectedUrls : new Set();
-  const isAllowed = isIgnoredNavigationUrl(currentTab.url)
-    || matchesExpectedNavigation(allowedUrls, state?.pending, currentTab.url, state?.expectedUrl);
-
-  if (!isAllowed) {
-    await cancelNavigation(tabId, "user-navigated-away", generation);
-    return { ok: false, reason: "user-navigated-away" };
-  }
-
-  tabNavigations.cancel(tabId, reason, generation);
   tabTransitionQueues.delete(tabId);
-  await removePending(tabId, generation);
-  await removeLanDiscovery(tabId, generation);
-
-  try {
-    await chrome.tabs.remove(tabId);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error };
-  }
+  return ownedTabController.removeOwnedTab(tabId, generation, reason);
 }
 
 function serializeSessionClaim(task) {
@@ -1159,7 +1107,11 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
       continue;
     }
     if (!tabNavigations.isActive(ownerTabId, generation)) {
-      continue;
+      const navContext = await ensureNavigationContext(ownerTabId);
+      if (!navContext || navContext.generation !== generation || !tabNavigations.isActive(ownerTabId, generation)) {
+        await removeLanDiscovery(ownerTabId, generation);
+        continue;
+      }
     }
 
     const signal = tabNavigations.getAbortSignal(ownerTabId, generation);
@@ -1182,9 +1134,9 @@ async function handleLanDiscoveryCandidate(tabId, tabUrl) {
       targetUrl: result.targetUrl,
       healthUrl: result.healthUrl,
       rootUrl: discovery.lanRootUrl
-    });
+    }, ownerTabId, generation);
 
-    if (!tabNavigations.isActive(ownerTabId, generation)) {
+    if (!route || !tabNavigations.isActive(ownerTabId, generation)) {
       return false;
     }
 
@@ -1582,6 +1534,7 @@ chrome.action.onClicked.addListener(() => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void cancelNavigation(tabId, "tab-removed");
+  void navPersistence.removeAllForTab(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {

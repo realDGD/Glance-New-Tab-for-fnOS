@@ -665,22 +665,8 @@ export class NavigationPersistence {
     return `pending-recovery:${tabId}:${generation}`;
   }
 
-  activeNavKey(tabId) {
-    return `nav-active:${tabId}`;
-  }
-
   discoveryKey(ownerTabId, generation) {
     return `lan-discovery:${ownerTabId}:${generation}`;
-  }
-
-  async getActivePointer(tabId) {
-    const s = this.storage;
-    if (!s) {
-      return null;
-    }
-    const key = this.activeNavKey(tabId);
-    const res = await s.get(key);
-    return res[key] ?? null;
   }
 
   async getPendingEnvelope(tabId, generation = null) {
@@ -688,21 +674,32 @@ export class NavigationPersistence {
     if (!s) {
       return null;
     }
-    let targetGen = generation;
-    if (targetGen === null) {
-      const active = await this.getActivePointer(tabId);
-      if (active && Number.isInteger(active.generation)) {
-        targetGen = active.generation;
-      }
-    }
-    if (targetGen !== null) {
-      const key = this.pendingKey(tabId, targetGen);
+    if (generation !== null) {
+      const key = this.pendingKey(tabId, generation);
       const res = await s.get(key);
       const stored = res[key];
       if (stored) {
         return parsePendingEnvelope(stored);
       }
+    } else {
+      // Find latest valid pending envelope for tab without shared pointer
+      const all = await s.get(null);
+      const prefix = `pending-recovery:${tabId}:`;
+      const candidates = [];
+      for (const [k, v] of Object.entries(all || {})) {
+        if (k.startsWith(prefix)) {
+          const parsed = parsePendingEnvelope(v);
+          if (parsed && parsed.pending) {
+            candidates.push(parsed);
+          }
+        }
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0) || (b.generation || 0) - (a.generation || 0));
+        return candidates[0];
+      }
     }
+
     // Fallback for legacy single key
     const legacyKey = `pending-recovery:${tabId}`;
     const legacyRes = await s.get(legacyKey);
@@ -722,15 +719,13 @@ export class NavigationPersistence {
       return false;
     }
     const key = this.pendingKey(tabId, generation);
-    const activeKey = this.activeNavKey(tabId);
     await s.set({
-      [key]: envelope,
-      [activeKey]: { generation, updatedAt: Date.now() }
+      [key]: envelope
     });
     return true;
   }
 
-  async removePendingEnvelope(tabId, generation) {
+  async removePendingEnvelope(tabId, generation = null) {
     const s = this.storage;
     if (!s) {
       return;
@@ -742,12 +737,25 @@ export class NavigationPersistence {
     const legacyKey = `pending-recovery:${tabId}`;
     keysToRemove.push(legacyKey);
     await s.remove(keysToRemove);
+  }
 
-    const activeKey = this.activeNavKey(tabId);
-    const activeRes = await s.get(activeKey);
-    const active = activeRes[activeKey];
-    if (active && (generation === null || active.generation === generation)) {
-      await s.remove(activeKey);
+  async removeAllForTab(tabId) {
+    const s = this.storage;
+    if (!s) {
+      return;
+    }
+    const all = await s.get(null);
+    const pendingPrefix = `pending-recovery:${tabId}:`;
+    const discoveryPrefix = `lan-discovery:${tabId}:`;
+    const keysToRemove = Object.keys(all || {}).filter((k) => (
+      k === `pending-recovery:${tabId}`
+      || k === `lan-discovery:${tabId}`
+      || k === `nav-active:${tabId}`
+      || k.startsWith(pendingPrefix)
+      || k.startsWith(discoveryPrefix)
+    ));
+    if (keysToRemove.length > 0) {
+      await s.remove(keysToRemove);
     }
   }
 
@@ -762,14 +770,17 @@ export class NavigationPersistence {
       return res[key] ?? null;
     }
     const all = await s.get(null);
+    const prefix = `lan-discovery:${ownerTabId}:`;
+    const now = Date.now();
+    let latest = null;
     for (const [key, value] of Object.entries(all || {})) {
-      if (key.startsWith(`lan-discovery:${ownerTabId}:`)) {
-        if (value && Number(value.expiresAt) > Date.now()) {
-          return value;
+      if (key.startsWith(prefix) && value && Number(value.expiresAt) > now) {
+        if (!latest || (value.startedAt || 0) > (latest.startedAt || 0)) {
+          latest = value;
         }
       }
     }
-    return null;
+    return latest;
   }
 
   async setDiscovery(ownerTabId, generation, discovery) {
@@ -930,7 +941,30 @@ export class TabNavigationManager {
 
   isActive(tabId, generation = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled) {
+    if (!state || state.cancelled || state.closing) {
+      return false;
+    }
+    if (generation !== null && state.generation !== generation) {
+      return false;
+    }
+    return true;
+  }
+
+  claimTabForRemoval(tabId, generation) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || state.closing) {
+      return null;
+    }
+    if (generation !== null && state.generation !== generation) {
+      return null;
+    }
+    state.closing = true;
+    return state;
+  }
+
+  isClaimedForRemoval(tabId, generation) {
+    const state = this.states.get(tabId);
+    if (!state || state.cancelled || !state.closing) {
       return false;
     }
     if (generation !== null && state.generation !== generation) {
@@ -1031,5 +1065,172 @@ export class TabNavigationManager {
     }
     this.states.clear();
     this.latestGenerations.clear();
+  }
+}
+
+export class OwnedTabController {
+  constructor(tabNavigations, persistence = null, tabsAdapter = null) {
+    this.tabNavigations = tabNavigations;
+    this.persistence = persistence;
+    this._tabsAdapter = tabsAdapter;
+  }
+
+  get tabs() {
+    if (this._tabsAdapter) {
+      return this._tabsAdapter;
+    }
+    if (typeof chrome !== "undefined" && chrome?.tabs) {
+      return chrome.tabs;
+    }
+    return null;
+  }
+
+  async removeOwnedTab(tabId, generation, reason = "close-owned-tab") {
+    if (!Number.isInteger(tabId) || !Number.isInteger(generation)) {
+      return { ok: false, reason: "invalid-params" };
+    }
+
+    const claimedState = this.tabNavigations.claimTabForRemoval(tabId, generation);
+    if (!claimedState) {
+      return { ok: false, reason: "stale-generation" };
+    }
+
+    let currentTab;
+    try {
+      if (!this.tabs?.get) {
+        throw new Error("tabs API unavailable");
+      }
+      currentTab = await this.tabs.get(tabId);
+    } catch {
+      this.tabNavigations.cancel(tabId, reason, generation);
+      if (this.persistence) {
+        await this.persistence.removePendingEnvelope(tabId, generation);
+        await this.persistence.removeDiscovery(tabId, generation);
+      }
+      return { ok: false, reason: "tab-not-found" };
+    }
+
+    if (!this.tabNavigations.isClaimedForRemoval(tabId, generation)) {
+      return { ok: false, reason: "stale-generation" };
+    }
+
+    if (typeof currentTab?.url === "string") {
+      const allowedUrls = claimedState.expectedUrls || new Set();
+      const isAllowed = isIgnoredNavigationUrl(currentTab.url)
+        || matchesExpectedNavigation(allowedUrls, claimedState.pending, currentTab.url, claimedState.expectedUrl);
+
+      if (!isAllowed) {
+        this.tabNavigations.cancel(tabId, "user-navigated-away", generation);
+        if (this.persistence) {
+          await this.persistence.removePendingEnvelope(tabId, generation);
+          await this.persistence.removeDiscovery(tabId, generation);
+        }
+        return { ok: false, reason: "user-navigated-away" };
+      }
+    }
+
+    this.tabNavigations.cancel(tabId, reason, generation);
+    if (this.persistence) {
+      await this.persistence.removePendingEnvelope(tabId, generation);
+      await this.persistence.removeDiscovery(tabId, generation);
+    }
+
+    try {
+      if (!this.tabs?.remove) {
+        throw new Error("tabs.remove unavailable");
+      }
+      await this.tabs.remove(tabId);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+}
+
+export class LanRouteStore {
+  constructor(tabNavigations = null, storageAdapter = null) {
+    this.tabNavigations = tabNavigations;
+    this._storage = storageAdapter;
+  }
+
+  get storage() {
+    if (this._storage) {
+      return this._storage;
+    }
+    if (typeof chrome !== "undefined" && chrome?.storage?.local) {
+      return chrome.storage.local;
+    }
+    return null;
+  }
+
+  async loadRoutes() {
+    const s = this.storage;
+    if (!s) {
+      return {};
+    }
+    const stored = await s.get("device-lan-routes");
+    const routes = stored?.["device-lan-routes"];
+    return routes && typeof routes === "object" ? routes : {};
+  }
+
+  async getRoute(targetUrl) {
+    if (!targetUrl) {
+      return null;
+    }
+    const routes = await this.loadRoutes();
+    const key = normalizeNavigableUrl(targetUrl);
+    return routes[key] ?? null;
+  }
+
+  async saveRoute(remoteTargetUrl, route, ownerTabId = null, generation = null) {
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
+
+    if (ownerTabId !== null && generation !== null && this.tabNavigations) {
+      if (!this.tabNavigations.isActive(ownerTabId, generation)) {
+        return null;
+      }
+    }
+
+    const key = normalizeNavigableUrl(remoteTargetUrl);
+    const existingRoutes = await this.loadRoutes();
+
+    if (ownerTabId !== null && generation !== null && this.tabNavigations) {
+      if (!this.tabNavigations.isActive(ownerTabId, generation)) {
+        return null;
+      }
+    }
+
+    const updatedRoute = {
+      ...route,
+      remoteTargetUrl: key,
+      learnedAt: Date.now()
+    };
+    existingRoutes[key] = updatedRoute;
+
+    await s.set({ ["device-lan-routes"]: existingRoutes });
+
+    if (typeof chrome !== "undefined" && chrome?.storage?.session) {
+      try {
+        await chrome.storage.session.remove(`lan-unreachable:${key}`);
+      } catch {
+        // Ignore
+      }
+    }
+
+    return updatedRoute;
+  }
+
+  async removeRoute(remoteTargetUrl) {
+    const s = this.storage;
+    if (!s) {
+      return;
+    }
+    const key = normalizeNavigableUrl(remoteTargetUrl);
+    const existingRoutes = await this.loadRoutes();
+    delete existingRoutes[key];
+    await s.set({ ["device-lan-routes"]: existingRoutes });
   }
 }
