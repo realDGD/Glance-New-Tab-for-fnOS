@@ -191,7 +191,15 @@ async function save() {
     if (!lanAccessResult.granted) {
       throw new Error("未获得这台 NAS 的局域网访问权限");
     }
-    if (renderedRemoteTarget && settings.targetUrl !== renderedRemoteTarget) {
+    const remoteTarget = (settings.targetUrl ?? "").trim();
+    const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
+    const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
+    const prevLanTarget = (renderedDeviceTarget ?? "").trim();
+
+    const remoteChanged = remoteTarget !== prevRemoteTarget;
+    const lanChanged = lanTarget !== prevLanTarget;
+
+    if (remoteChanged || lanChanged) {
       try {
         await chrome.storage.local.remove(ACTIVE_PREVIEW_TARGET_KEY);
       } catch {

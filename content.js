@@ -459,6 +459,27 @@
     }
   }
 
+  async function saveCurrentGlancePreview(targetUrl = location.href) {
+    try {
+      if (pageAuthenticationFailure() || pageContainsLoginForm()) {
+        return false;
+      }
+      const preview = extractGlancePreview(document, targetUrl);
+      if (preview && Array.isArray(preview.columns) && preview.columns.length > 0) {
+        const key = previewStorageKey(targetUrl);
+        const normTarget = normalizeNavigableUrl(targetUrl);
+        await chrome.storage.local.set({
+          [key]: preview,
+          [ACTIVE_PREVIEW_TARGET_KEY]: normTarget
+        });
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   let previewLayer = null;
   let promptCard = null;
 
@@ -1057,19 +1078,7 @@
       stopped = true;
       await send({ type: "TARGET_READY" });
 
-      try {
-        const preview = extractGlancePreview(document, pending.targetUrl);
-        if (preview && preview.columns?.length > 0) {
-          const key = previewStorageKey(pending.targetUrl);
-          const normTarget = normalizeNavigableUrl(pending.targetUrl);
-          await chrome.storage.local.set({
-            [key]: preview,
-            [ACTIVE_PREVIEW_TARGET_KEY]: normTarget
-          });
-        }
-      } catch {
-        // Ignore preview save error
-      }
+      void saveCurrentGlancePreview(pending.targetUrl);
 
       await startKeepAlive(
         pending.recoveryKind === "native-lan"
@@ -1373,6 +1382,10 @@
 
     if (!directFailure) {
       await waitForVisualReady();
+      void saveCurrentGlancePreview(location.href);
+      await new Promise((resolve) => window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(resolve);
+      }));
       fadeOutLoadingOverlay();
     }
   }

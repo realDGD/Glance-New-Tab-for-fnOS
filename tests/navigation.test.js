@@ -23,6 +23,7 @@ import {
   sanitizeSafeUrl,
   sanitizeSafeText,
   extractGlancePreview,
+  saveGlancePreviewToStorage,
   getPreviewStatus,
   renderGlancePreviewHtml,
   renderGlanceSkeletonHtml
@@ -1744,6 +1745,366 @@ test("UX-T9: Full lifecycle from Cached Preview to TARGET_READY fade with zero s
 
   assert.equal(previewLayerVisible, true);
   assert.equal(promptCardVisible, false);
+});
+
+test("P0-T1: LAN fast path refreshes Preview and updates active target pointer", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const lanTargetUrl = "http://192.168.1.10:18080/";
+  const mockDoc = {
+    title: "LAN Glance Dashboard",
+    documentElement: { dataset: { theme: "auto" } },
+    body: { classList: { contains: () => false } },
+    querySelectorAll(sel) {
+      if (sel.includes(".column")) {
+        return [{
+          querySelectorAll() {
+            return [{
+              querySelector(s) {
+                if (s.includes("password") || s.includes("token")) return null;
+                if (s.includes("h1") || s.includes(".title")) return { textContent: "LAN Services" };
+                return null;
+              },
+              querySelectorAll() {
+                return [{
+                  tagName: "A",
+                  textContent: "Router Admin",
+                  getAttribute() { return "http://192.168.1.1/"; },
+                  querySelector() { return null; }
+                }];
+              }
+            }];
+          }
+        }];
+      }
+      return [];
+    }
+  };
+
+  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, lanTargetUrl);
+  assert.equal(saved, true);
+
+  const key = previewStorageKey(lanTargetUrl);
+  assert.equal(store.has(key), true);
+  assert.equal(store.get(key).pageTitle, "LAN Glance Dashboard");
+  assert.equal(store.get(key).columns[0].widgets[0].title, "LAN Services");
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
+});
+
+test("P0-T2: Normal remote/direct success refreshes Preview and active pointer", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const remoteUrl = "https://demo-nas.5ddd.com/app/glance/";
+  const mockDoc = {
+    title: "Remote Glance",
+    documentElement: { dataset: { theme: "dark" } },
+    body: { classList: { contains: () => true } },
+    querySelectorAll(sel) {
+      if (sel.includes(".column")) {
+        return [{
+          querySelectorAll() {
+            return [{
+              querySelector(s) {
+                if (s.includes("password")) return null;
+                if (s.includes("h1") || s.includes(".title")) return { textContent: "Remote Apps" };
+                return null;
+              },
+              querySelectorAll() { return []; }
+            }];
+          }
+        }];
+      }
+      return [];
+    }
+  };
+
+  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, remoteUrl);
+  assert.equal(saved, true);
+  assert.equal(store.has(previewStorageKey(remoteUrl)), true);
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://demo-nas.5ddd.com/app/glance/");
+});
+
+test("P0-T3: Pending target recovery success still refreshes Preview", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const recoveryTargetUrl = "https://service-0.demo.fnos.net/glance/";
+  const mockDoc = {
+    title: "Recovered Target",
+    documentElement: { dataset: { theme: "light" } },
+    body: { classList: { contains: () => false } },
+    querySelectorAll(sel) {
+      if (sel.includes(".column")) {
+        return [{
+          querySelectorAll() {
+            return [{
+              querySelector(s) {
+                if (s.includes("password")) return null;
+                if (s.includes(".title")) return { textContent: "Recovered Widget" };
+                return null;
+              },
+              querySelectorAll() { return []; }
+            }];
+          }
+        }];
+      }
+      return [];
+    }
+  };
+
+  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, recoveryTargetUrl);
+  assert.equal(saved, true);
+  assert.equal(store.has(previewStorageKey(recoveryTargetUrl)), true);
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://service-0.demo.fnos.net/glance/");
+});
+
+test("P0-T4: Failed pages do NOT save Preview", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  // Mock doc with password inputs (login page)
+  const loginDoc = {
+    title: "fnOS Login",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll(sel) {
+      if (sel.includes(".column")) {
+        return [{
+          querySelectorAll() {
+            return [{
+              querySelector(s) {
+                if (s.includes("password")) return { tagName: "INPUT", type: "password" };
+                return null;
+              },
+              querySelectorAll() { return []; }
+            }];
+          }
+        }];
+      }
+      return [];
+    }
+  };
+
+  const saved = await saveGlancePreviewToStorage(mockStorage, loginDoc, "https://nas.local/login");
+  assert.equal(saved, false);
+  assert.equal(store.size, 0);
+});
+
+test("P0-T5: Preview save error does not throw or block execution", async () => {
+  const faultyStorage = {
+    async set() {
+      throw new Error("QuotaExceededError: storage is full");
+    }
+  };
+
+  const mockDoc = {
+    title: "Glance",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll() {
+      return [{ querySelectorAll: () => [{ querySelector: () => ({ textContent: "W" }), querySelectorAll: () => [] }] }];
+    }
+  };
+
+  // Should safely catch the storage error and return false without throwing
+  let threw = false;
+  try {
+    const result = await saveGlancePreviewToStorage(faultyStorage, mockDoc, "https://glance.local/");
+    assert.equal(result, false);
+  } catch {
+    threw = true;
+  }
+  assert.equal(threw, false);
+});
+
+test("P0-T6: Preview savedAt and content are updated on consecutive successes", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const targetUrl = "http://192.168.1.10:8080/";
+  const doc1 = {
+    title: "Glance Version 1",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{
+      querySelectorAll: () => [{
+        querySelector: (sel) => {
+          if (sel.includes("password") || sel.includes("token")) return null;
+          return { textContent: "Card 1" };
+        },
+        querySelectorAll: () => []
+      }]
+    }]
+  };
+
+  await saveGlancePreviewToStorage(mockStorage, doc1, targetUrl);
+  const key = previewStorageKey(targetUrl);
+  const preview1 = store.get(key);
+  assert.ok(preview1);
+  assert.equal(preview1.pageTitle, "Glance Version 1");
+  const savedAt1 = preview1.savedAt;
+
+  // Simulate a delay and page content update
+  await new Promise((r) => setTimeout(r, 10));
+
+  const doc2 = {
+    title: "Glance Version 2",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{
+      querySelectorAll: () => [{
+        querySelector: (sel) => {
+          if (sel.includes("password") || sel.includes("token")) return null;
+          return { textContent: "Card 2" };
+        },
+        querySelectorAll: () => []
+      }]
+    }]
+  };
+
+  await saveGlancePreviewToStorage(mockStorage, doc2, targetUrl);
+  const preview2 = store.get(key);
+  assert.ok(preview2);
+  assert.equal(preview2.pageTitle, "Glance Version 2");
+  assert.ok(preview2.savedAt > savedAt1);
+});
+
+test("P1-T7: Remote target changed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
+  const store = new Map();
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, "https://nas-a.5ddd.com/");
+
+  const settings = { targetUrl: "https://nas-b.5ddd.com/" };
+  const renderedRemoteTarget = "https://nas-a.5ddd.com/";
+  const lanAccessResult = { targetUrl: "http://192.168.1.10:8080/" };
+  const renderedDeviceTarget = "http://192.168.1.10:8080/";
+
+  const remoteTarget = (settings.targetUrl ?? "").trim();
+  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
+  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
+  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
+
+  const remoteChanged = remoteTarget !== prevRemoteTarget;
+  const lanChanged = lanTarget !== prevLanTarget;
+
+  if (remoteChanged || lanChanged) {
+    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
+  }
+
+  assert.equal(remoteChanged, true);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+});
+
+test("P1-T8: LAN target changed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
+  const store = new Map();
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
+
+  const settings = { targetUrl: "https://nas.5ddd.com/" };
+  const renderedRemoteTarget = "https://nas.5ddd.com/";
+  const lanAccessResult = { targetUrl: "http://192.168.1.20:8080/" };
+  const renderedDeviceTarget = "http://192.168.1.10:8080/";
+
+  const remoteTarget = (settings.targetUrl ?? "").trim();
+  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
+  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
+  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
+
+  const remoteChanged = remoteTarget !== prevRemoteTarget;
+  const lanChanged = lanTarget !== prevLanTarget;
+
+  if (remoteChanged || lanChanged) {
+    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
+  }
+
+  assert.equal(lanChanged, true);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+});
+
+test("P1-T9: LAN target removed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
+  const store = new Map();
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
+
+  const settings = { targetUrl: "https://nas.5ddd.com/" };
+  const renderedRemoteTarget = "https://nas.5ddd.com/";
+  const lanAccessResult = { targetUrl: "" };
+  const renderedDeviceTarget = "http://192.168.1.10:8080/";
+
+  const remoteTarget = (settings.targetUrl ?? "").trim();
+  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
+  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
+  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
+
+  const remoteChanged = remoteTarget !== prevRemoteTarget;
+  const lanChanged = lanTarget !== prevLanTarget;
+
+  if (remoteChanged || lanChanged) {
+    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
+  }
+
+  assert.equal(lanChanged, true);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+});
+
+test("P1-T10: Target unchanged preserves ACTIVE_PREVIEW_TARGET_KEY", async () => {
+  const store = new Map();
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
+
+  const settings = { targetUrl: "https://nas.5ddd.com/" };
+  const renderedRemoteTarget = "https://nas.5ddd.com/";
+  const lanAccessResult = { targetUrl: "http://192.168.1.10:8080/" };
+  const renderedDeviceTarget = "http://192.168.1.10:8080/";
+
+  const remoteTarget = (settings.targetUrl ?? "").trim();
+  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
+  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
+  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
+
+  const remoteChanged = remoteTarget !== prevRemoteTarget;
+  const lanChanged = lanTarget !== prevLanTarget;
+
+  if (remoteChanged || lanChanged) {
+    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
+  }
+
+  assert.equal(remoteChanged, false);
+  assert.equal(lanChanged, false);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), true);
+});
+
+test("P1-T11: Old Preview entities are preserved when active pointer is cleared", async () => {
+  const store = new Map();
+  const keyA = previewStorageKey("https://nas-a.5ddd.com/");
+  store.set(keyA, { version: 1, pageTitle: "Preview A", savedAt: Date.now() });
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, "https://nas-a.5ddd.com/");
+
+  // Switch to target B
+  store.delete(ACTIVE_PREVIEW_TARGET_KEY);
+
+  // Active target pointer is cleared, but Preview A entity is preserved
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+  assert.equal(store.has(keyA), true);
+  assert.equal(store.get(keyA).pageTitle, "Preview A");
 });
 
 

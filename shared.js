@@ -1537,6 +1537,27 @@ export function extractGlancePreview(rootDocument, targetUrl) {
   }
 }
 
+export async function saveGlancePreviewToStorage(storageArea, rootDocument, targetUrl) {
+  try {
+    if (!storageArea || typeof storageArea.set !== "function") {
+      return false;
+    }
+    const preview = extractGlancePreview(rootDocument, targetUrl);
+    if (preview && Array.isArray(preview.columns) && preview.columns.length > 0) {
+      const key = previewStorageKey(targetUrl);
+      const normTarget = normalizeNavigableUrl(targetUrl);
+      await storageArea.set({
+        [key]: preview,
+        [ACTIVE_PREVIEW_TARGET_KEY]: normTarget
+      });
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function getPreviewStatus(preview) {
   if (!preview || typeof preview !== "object" || !preview.savedAt) {
     return "none";
