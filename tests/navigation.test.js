@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { execSync } from "node:child_process";
 
 import {
   TabNavigationManager,
@@ -17,18 +19,8 @@ import {
   NavigationPersistence,
   OwnedTabController,
   LanRouteStore,
-  PREVIEW_KEY_PREFIX,
-  ACTIVE_PREVIEW_TARGET_KEY,
-  previewStorageKey,
-  sanitizeSafeUrl,
-  sanitizeSafeText,
-  extractGlancePreview,
-  saveGlancePreviewToStorage,
-  schedulePreviewRefresh,
   finishTargetPresentation,
-  getPreviewStatus,
-  renderGlancePreviewHtml,
-  renderGlanceSkeletonHtml
+  cleanupLegacyPreviewStorage
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -1273,194 +1265,67 @@ test("T6: Consecutive begins produce unique UUIDs with no collision or reuse", (
   assert.equal(manager.isActive(tabId, navB.navigationId), true);
 });
 
-test("T7: Preview storage key generation matches normalized URL and respects ACTIVE_PREVIEW_TARGET_KEY", () => {
-  const key1 = previewStorageKey("https://glance.local:8080/dashboard/");
-  const key2 = previewStorageKey("https://glance.local:8080/dashboard");
-  assert.equal(key1, key2);
-  assert.equal(key1, "glance-preview:https://glance.local:8080/dashboard");
-  assert.equal(ACTIVE_PREVIEW_TARGET_KEY, "glance-preview-active-target");
-});
+test("T1: content.js syntax check - passes node --check with no duplicate declarations or SyntaxError", () => {
+  const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
+  assert.ok(contentJs.length > 0);
 
-test("T8: renderGlanceSkeletonHtml returns clean skeleton layout without error", () => {
-  const darkSkeleton = renderGlanceSkeletonHtml("dark");
-  assert.ok(darkSkeleton.includes("skeleton-layout"));
-  assert.ok(darkSkeleton.includes("skeleton-card"));
-  assert.ok(darkSkeleton.includes("glance-skeleton-bar"));
-
-  const lightSkeleton = renderGlanceSkeletonHtml("light");
-  assert.ok(lightSkeleton.includes("skeleton-layout"));
-});
-
-test("T9: renderGlancePreviewHtml renders structured cards, headers, and fresh/stale badges", () => {
-  const samplePreview = {
-    version: 1,
-    savedAt: Date.now(),
-    theme: "dark",
-    pageTitle: "My Personal Glance",
-    columns: [
-      {
-        widgets: [
-          {
-            title: "Quick Links",
-            items: [
-              { title: "NAS Admin", url: "https://nas.local/" },
-              { title: "Docker", url: "https://docker.local/" }
-            ]
-          }
-        ]
-      }
-    ]
-  };
-
-  const freshHtml = renderGlancePreviewHtml(samplePreview, "fresh");
-  assert.ok(freshHtml.includes("My Personal Glance"));
-  assert.ok(freshHtml.includes("Quick Links"));
-  assert.ok(freshHtml.includes("NAS Admin"));
-  assert.equal(freshHtml.includes("正在刷新"), false);
-
-  const staleHtml = renderGlancePreviewHtml(samplePreview, "stale");
-  assert.ok(staleHtml.includes("正在刷新"));
-});
-
-test("T10: getPreviewStatus correctly differentiates fresh, stale, expired, and none", () => {
-  const now = Date.now();
-
-  assert.equal(getPreviewStatus(null), "none");
-  assert.equal(getPreviewStatus({}), "none");
-
-  // 10 minutes ago -> fresh (< 30 min)
-  assert.equal(getPreviewStatus({ savedAt: now - 10 * 60 * 1000 }), "fresh");
-
-  // 2 hours ago -> stale (30 min ~ 6 hours)
-  assert.equal(getPreviewStatus({ savedAt: now - 2 * 3600 * 1000 }), "stale");
-
-  // 8 hours ago -> expired (> 6 hours)
-  assert.equal(getPreviewStatus({ savedAt: now - 8 * 3600 * 1000 }), "expired");
-});
-
-test("T11: sanitizeSafeUrl case-insensitively strips sensitive tokens and secrets", () => {
-  const dirtyUrl1 = "https://nas.local/dashboard?Token=secret123&API_KEY=key456&normalParam=ok#access_token=xyz";
-  const cleanUrl1 = sanitizeSafeUrl(dirtyUrl1);
-
-  assert.equal(cleanUrl1.includes("Token="), false);
-  assert.equal(cleanUrl1.includes("API_KEY="), false);
-  assert.equal(cleanUrl1.includes("access_token="), false);
-  assert.equal(cleanUrl1.includes("normalParam=ok"), true);
-
-  const dirtyUrl2 = "http://glance.local/?auth_token=jwt123&Password=mysecret&sig=abc123";
-  const cleanUrl2 = sanitizeSafeUrl(dirtyUrl2);
-  assert.equal(cleanUrl2.includes("auth_token="), false);
-  assert.equal(cleanUrl2.includes("Password="), false);
-  assert.equal(cleanUrl2.includes("sig="), false);
-});
-
-test("T12: extractGlancePreview skips sensitive form inputs, passwords, tokens and secrets", () => {
-  const mockDoc = {
-    title: "Glance Dashboard - Home",
-    documentElement: { dataset: { theme: "dark" } },
-    body: { classList: { contains: () => true } },
-    querySelectorAll(selector) {
-      if (selector.includes(".column")) {
-        return [
-          {
-            querySelectorAll() {
-              return [
-                // Safe widget
-                {
-                  querySelector(sel) {
-                    if (sel.includes("password") || sel.includes("token") || sel.includes("auth") || sel.includes("hidden")) return null;
-                    if (sel.includes("h1") || sel.includes(".title")) return { textContent: "Bookmarks" };
-                    return null;
-                  },
-                  querySelectorAll(sel) {
-                    if (sel.includes("li") || sel.includes("a")) {
-                      return [
-                        {
-                          tagName: "A",
-                          textContent: "Documentation",
-                          getAttribute(attr) {
-                            if (attr === "href") return "https://docs.glance.local/?token=secretToken123&session=xyz#token=abc";
-                            return null;
-                          },
-                          querySelector() { return null; }
-                        },
-                        {
-                          tagName: "A",
-                          textContent: "GitHub Repo",
-                          getAttribute(attr) {
-                            if (attr === "href") return "https://github.com/glanceapp/glance";
-                            return null;
-                          },
-                          querySelector() { return null; }
-                        }
-                      ];
-                    }
-                    return [];
-                  }
-                },
-                // Sensitive widget with password/token/auth input (must be skipped)
-                {
-                  querySelector(sel) {
-                    if (sel.includes("password")) return { tagName: "INPUT", type: "password" };
-                    if (sel.includes("h1") || sel.includes(".title")) return { textContent: "Login Form" };
-                    return null;
-                  },
-                  querySelectorAll() { return []; }
-                }
-              ];
-            }
-          }
-        ];
-      }
-      return [];
+  // Assert no duplicate top-level let declarations that previously broke parser
+  const letMatches = contentJs.match(/\blet\s+([a-zA-Z0-9_$]+)/g) || [];
+  const letNames = letMatches.map((m) => m.replace(/^let\s+/, "").trim());
+  const uniqueNames = new Set();
+  const duplicates = [];
+  for (const name of letNames) {
+    if (uniqueNames.has(name)) {
+      duplicates.push(name);
     }
-  };
+    uniqueNames.add(name);
+  }
+  // All top-level declared identifiers in closure scope must be distinct
+  assert.equal(duplicates.includes("previewLayer"), false);
+  assert.equal(duplicates.includes("promptCard"), false);
 
-  const preview = extractGlancePreview(mockDoc, "http://192.168.1.50:8080/");
-  assert.ok(preview);
-  assert.equal(preview.version, 1);
-  assert.equal(preview.theme, "dark");
-  assert.equal(preview.pageTitle, "Glance Dashboard - Home");
-  assert.equal(preview.columns.length, 1);
-
-  const widgets = preview.columns[0].widgets;
-  assert.equal(widgets.length, 1);
-  assert.equal(widgets[0].title, "Bookmarks");
-
-  const docLink = widgets[0].items[0];
-  assert.equal(docLink.title, "Documentation");
-  assert.equal(docLink.url.includes("token="), false);
-  assert.equal(docLink.url.includes("session="), false);
+  // Direct check with Node.js parser
+  assert.doesNotThrow(() => {
+    execSync("node --check content.js", { cwd: new URL("..", import.meta.url) });
+  });
 });
 
-test("T13: Concurrent preview saves for different Glance targets do not overwrite each other", async () => {
+test("T2: JS codebase syntax check - all production script files parse cleanly", () => {
+  assert.doesNotThrow(() => {
+    execSync("node --check content.js shared.js background.js newtab.js options.js", {
+      cwd: new URL("..", import.meta.url)
+    });
+  });
+});
+
+test("T3: Legacy preview cleanup - cleanupLegacyPreviewStorage clears old preview keys while preserving user settings and LAN routes", async () => {
   const store = new Map();
+  store.set("glance-preview:https://nas.local/glance/", { title: "Old Preview" });
+  store.set("glance-preview-active-target", "https://nas.local/glance/");
+  store.set("lan-route:https://nas.local/", { targetUrl: "http://192.168.1.10:8080/" });
+  store.set("user-setting-custom", { enabled: true });
+
   const mockStorage = {
     async get(keys) {
       if (keys === null) return Object.fromEntries(store);
       if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
       return { [keys]: store.get(keys) };
     },
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
     }
   };
 
-  const key1 = previewStorageKey("https://glance1.local/");
-  const key2 = previewStorageKey("https://glance2.local/");
+  await cleanupLegacyPreviewStorage(mockStorage);
 
-  const preview1 = { version: 1, pageTitle: "Glance 1", savedAt: Date.now(), columns: [] };
-  const preview2 = { version: 1, pageTitle: "Glance 2", savedAt: Date.now(), columns: [] };
-
-  await mockStorage.set({ [key1]: preview1 });
-  await mockStorage.set({ [key2]: preview2 });
-
-  const all = await mockStorage.get(null);
-  assert.equal(all[key1].pageTitle, "Glance 1");
-  assert.equal(all[key2].pageTitle, "Glance 2");
+  assert.equal(store.has("glance-preview:https://nas.local/glance/"), false);
+  assert.equal(store.has("glance-preview-active-target"), false);
+  assert.equal(store.has("lan-route:https://nas.local/"), true);
+  assert.equal(store.has("user-setting-custom"), true);
 });
 
-test("UX-T1: Closed ShadowRoot Fade accesses preserved screen reference and triggers fade", () => {
+test("T4: Closed ShadowRoot Fade accesses preserved screen reference and triggers fade", () => {
   let loadingHost = null;
   let loadingScreen = null;
 
@@ -1540,7 +1405,7 @@ test("UX-T1: Closed ShadowRoot Fade accesses preserved screen reference and trig
   assert.equal(loadingScreen, null);
 });
 
-test("UX-T2: Truly fade before remove and cleans up references", (t, done) => {
+test("T5: Closed ShadowRoot Fade resolves on transitionend event", (t, done) => {
   let loadingHost = { removed: false, remove() { this.removed = true; } };
   let loadingScreen = {
     style: {},
@@ -1575,1127 +1440,24 @@ test("UX-T2: Truly fade before remove and cleans up references", (t, done) => {
   assert.equal(hostRef.removed, false);
 });
 
-test("UX-T3: Missing screen fallback safely removes host without uncaught errors", () => {
-  let loadingHost = { removed: false, remove() { this.removed = true; } };
-  let loadingScreen = null;
-
-  let completed = false;
-  function fadeOut(cb) {
-    if (!loadingHost) { cb?.(); return; }
-    const screen = loadingScreen;
-    if (screen) {
-      // ...
-    } else {
-      loadingHost.remove();
-      loadingHost = null;
-      loadingScreen = null;
-      cb?.();
-    }
-  }
-
-  fadeOut(() => { completed = true; });
-  assert.equal(completed, true);
-  assert.equal(loadingHost, null);
-});
-
-test("UX-T4: Content current target strictly matches current location preview", async () => {
-  const store = new Map();
-  const urlA = "https://nas-a.5ddd.com/glance/";
-  const urlB = "https://nas-b.5ddd.com/glance/";
-  const keyA = previewStorageKey(urlA);
-  const keyB = previewStorageKey(urlB);
-
-  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget A" }] }] });
-  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget B" }] }] });
-
-  const curLocation = urlB;
-  const curKey = previewStorageKey(curLocation);
-  const result = store.get(curKey);
-
-  assert.ok(result);
-  assert.equal(result.pageTitle, "Glance B");
-  const html = renderGlancePreviewHtml(result, getPreviewStatus(result));
-  assert.ok(html.includes("Glance B"));
-  assert.ok(html.includes("Widget B"));
-  assert.equal(html.includes("Widget A"), false);
-});
-
-test("UX-T5: Content missing current target preview stays on Skeleton and NEVER falls back to active target pointer", async () => {
-  const store = new Map();
-  const urlA = "https://nas-a.5ddd.com/glance/";
-  const urlB = "https://nas-b.5ddd.com/glance/";
-  const keyA = previewStorageKey(urlA);
-
-  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget A" }] }] });
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlA);
-
-  const curLocation = urlB;
-  const curKey = previewStorageKey(curLocation);
-  const preview = store.get(curKey) || null;
-
-  assert.equal(preview, null);
-  const html = preview ? renderGlancePreviewHtml(preview) : renderGlanceSkeletonHtml("auto");
-  assert.ok(html.includes("skeleton-layout"));
-  assert.equal(html.includes("Glance A"), false);
-  assert.equal(html.includes("Widget A"), false);
-});
-
-test("UX-T6: Newtab renders matching preview when ACTIVE_PREVIEW_TARGET_KEY exists", async () => {
-  const store = new Map();
-  const urlA = "https://nas-a.5ddd.com/glance/";
-  const urlB = "https://nas-b.5ddd.com/glance/";
-  const keyA = previewStorageKey(urlA);
-  const keyB = previewStorageKey(urlB);
-
-  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "A" }] }] });
-  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlB);
-
-  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
-  let foundPreview = null;
-  if (activeTarget) {
-    const key = previewStorageKey(activeTarget);
-    const val = store.get(key);
-    if (val && (getPreviewStatus(val) === "fresh" || getPreviewStatus(val) === "stale")) {
-      foundPreview = val;
-    }
-  }
-
-  assert.ok(foundPreview);
-  assert.equal(foundPreview.pageTitle, "Glance B");
-});
-
-test("UX-T7: Newtab renders Skeleton when active target has no preview without random fallback", async () => {
-  const store = new Map();
-  const urlA = "https://nas-a.5ddd.com/glance/";
-  const urlB = "https://nas-b.5ddd.com/glance/";
-  const urlC = "https://nas-c.5ddd.com/glance/";
-  const keyA = previewStorageKey(urlA);
-  const keyB = previewStorageKey(urlB);
-
-  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "A" }] }] });
-  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlC);
-
-  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
-  let foundPreview = null;
-  if (activeTarget) {
-    const key = previewStorageKey(activeTarget);
-    const val = store.get(key);
-    if (val && (getPreviewStatus(val) === "fresh" || getPreviewStatus(val) === "stale")) {
-      foundPreview = val;
-    }
-  }
-
-  assert.equal(foundPreview, null);
-  const html = foundPreview ? renderGlancePreviewHtml(foundPreview) : renderGlanceSkeletonHtml("auto");
-  assert.ok(html.includes("skeleton-layout"));
-  assert.equal(html.includes("Glance A"), false);
-  assert.equal(html.includes("Glance B"), false);
-});
-
-test("UX-T8: Expired preview renders Skeleton and NEVER falls back to another target fresh preview", async () => {
-  const store = new Map();
-  const urlA = "https://nas-a.5ddd.com/glance/";
-  const urlB = "https://nas-b.5ddd.com/glance/";
-  const keyA = previewStorageKey(urlA);
-  const keyB = previewStorageKey(urlB);
-
-  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now() - 10 * 3600 * 1000, columns: [{ widgets: [{ title: "A" }] }] });
-  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlA);
-
-  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
-  let foundPreview = null;
-  if (activeTarget) {
-    const key = previewStorageKey(activeTarget);
-    const val = store.get(key);
-    const status = getPreviewStatus(val);
-    if (status === "fresh" || status === "stale") {
-      foundPreview = val;
-    }
-  }
-
-  assert.equal(foundPreview, null);
-  const html = foundPreview ? renderGlancePreviewHtml(foundPreview) : renderGlanceSkeletonHtml("auto");
-  assert.ok(html.includes("skeleton-layout"));
-  assert.equal(html.includes("Glance B"), false);
-});
-
-test("UX-T9: Full lifecycle from Cached Preview to TARGET_READY fade with zero spinner", () => {
-  let previewLayerVisible = true;
-  let promptCardVisible = false;
-
-  function ensureLoadingOverlay(preview) {
-    previewLayerVisible = true;
-    promptCardVisible = false;
-  }
-
-  function setLoading(msg) {
-    previewLayerVisible = false;
-    promptCardVisible = true;
-  }
-
-  ensureLoadingOverlay({ version: 1, pageTitle: "My Glance" });
-  assert.equal(previewLayerVisible, true);
-  assert.equal(promptCardVisible, false);
-
-  const renderedFailure = null;
-  if (renderedFailure) {
-    setLoading("Auth failure");
-  }
-
-  assert.equal(previewLayerVisible, true);
-  assert.equal(promptCardVisible, false);
-});
-
-test("P0-T1: LAN fast path refreshes Preview and updates active target pointer", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const lanTargetUrl = "http://192.168.1.10:18080/";
-  const mockDoc = {
-    title: "LAN Glance Dashboard",
-    documentElement: { dataset: { theme: "auto" } },
-    body: { classList: { contains: () => false } },
-    querySelectorAll(sel) {
-      if (sel.includes(".column")) {
-        return [{
-          querySelectorAll() {
-            return [{
-              querySelector(s) {
-                if (s.includes("password") || s.includes("token")) return null;
-                if (s.includes("h1") || s.includes(".title")) return { textContent: "LAN Services" };
-                return null;
-              },
-              querySelectorAll() {
-                return [{
-                  tagName: "A",
-                  textContent: "Router Admin",
-                  getAttribute() { return "http://192.168.1.1/"; },
-                  querySelector() { return null; }
-                }];
-              }
-            }];
-          }
-        }];
-      }
-      return [];
-    }
-  };
-
-  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, lanTargetUrl);
-  assert.equal(saved, true);
-
-  const key = previewStorageKey(lanTargetUrl);
-  assert.equal(store.has(key), true);
-  assert.equal(store.get(key).pageTitle, "LAN Glance Dashboard");
-  assert.equal(store.get(key).columns[0].widgets[0].title, "LAN Services");
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
-});
-
-test("P0-T2: Normal remote/direct success refreshes Preview and active pointer", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const remoteUrl = "https://demo-nas.5ddd.com/app/glance/";
-  const mockDoc = {
-    title: "Remote Glance",
-    documentElement: { dataset: { theme: "dark" } },
-    body: { classList: { contains: () => true } },
-    querySelectorAll(sel) {
-      if (sel.includes(".column")) {
-        return [{
-          querySelectorAll() {
-            return [{
-              querySelector(s) {
-                if (s.includes("password")) return null;
-                if (s.includes("h1") || s.includes(".title")) return { textContent: "Remote Apps" };
-                return null;
-              },
-              querySelectorAll() { return []; }
-            }];
-          }
-        }];
-      }
-      return [];
-    }
-  };
-
-  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, remoteUrl);
-  assert.equal(saved, true);
-  assert.equal(store.has(previewStorageKey(remoteUrl)), true);
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://demo-nas.5ddd.com/app/glance/");
-});
-
-test("P0-T3: Pending target recovery success still refreshes Preview", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const recoveryTargetUrl = "https://service-0.demo.fnos.net/glance/";
-  const mockDoc = {
-    title: "Recovered Target",
-    documentElement: { dataset: { theme: "light" } },
-    body: { classList: { contains: () => false } },
-    querySelectorAll(sel) {
-      if (sel.includes(".column")) {
-        return [{
-          querySelectorAll() {
-            return [{
-              querySelector(s) {
-                if (s.includes("password")) return null;
-                if (s.includes(".title")) return { textContent: "Recovered Widget" };
-                return null;
-              },
-              querySelectorAll() { return []; }
-            }];
-          }
-        }];
-      }
-      return [];
-    }
-  };
-
-  const saved = await saveGlancePreviewToStorage(mockStorage, mockDoc, recoveryTargetUrl);
-  assert.equal(saved, true);
-  assert.equal(store.has(previewStorageKey(recoveryTargetUrl)), true);
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://service-0.demo.fnos.net/glance/");
-});
-
-test("P0-T4: Failed pages do NOT save Preview", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  // Mock doc with password inputs (login page)
-  const loginDoc = {
-    title: "fnOS Login",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll(sel) {
-      if (sel.includes(".column")) {
-        return [{
-          querySelectorAll() {
-            return [{
-              querySelector(s) {
-                if (s.includes("password")) return { tagName: "INPUT", type: "password" };
-                return null;
-              },
-              querySelectorAll() { return []; }
-            }];
-          }
-        }];
-      }
-      return [];
-    }
-  };
-
-  const saved = await saveGlancePreviewToStorage(mockStorage, loginDoc, "https://nas.local/login");
-  assert.equal(saved, false);
-  assert.equal(store.size, 0);
-});
-
-test("P0-T5: Preview save error does not throw or block execution", async () => {
-  const faultyStorage = {
-    async set() {
-      throw new Error("QuotaExceededError: storage is full");
-    }
-  };
-
-  const mockDoc = {
-    title: "Glance",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll() {
-      return [{ querySelectorAll: () => [{ querySelector: () => ({ textContent: "W" }), querySelectorAll: () => [] }] }];
-    }
-  };
-
-  // Should safely catch the storage error and return false without throwing
-  let threw = false;
-  try {
-    const result = await saveGlancePreviewToStorage(faultyStorage, mockDoc, "https://glance.local/");
-    assert.equal(result, false);
-  } catch {
-    threw = true;
-  }
-  assert.equal(threw, false);
-});
-
-test("P0-T6: Preview savedAt and content are updated on consecutive successes", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const targetUrl = "http://192.168.1.10:8080/";
-  const doc1 = {
-    title: "Glance Version 1",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{
-      querySelectorAll: () => [{
-        querySelector: (sel) => {
-          if (sel.includes("password") || sel.includes("token")) return null;
-          return { textContent: "Card 1" };
-        },
-        querySelectorAll: () => []
-      }]
-    }]
-  };
-
-  await saveGlancePreviewToStorage(mockStorage, doc1, targetUrl);
-  const key = previewStorageKey(targetUrl);
-  const preview1 = store.get(key);
-  assert.ok(preview1);
-  assert.equal(preview1.pageTitle, "Glance Version 1");
-  const savedAt1 = preview1.savedAt;
-
-  // Simulate a delay and page content update
-  await new Promise((r) => setTimeout(r, 10));
-
-  const doc2 = {
-    title: "Glance Version 2",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{
-      querySelectorAll: () => [{
-        querySelector: (sel) => {
-          if (sel.includes("password") || sel.includes("token")) return null;
-          return { textContent: "Card 2" };
-        },
-        querySelectorAll: () => []
-      }]
-    }]
-  };
-
-  await saveGlancePreviewToStorage(mockStorage, doc2, targetUrl);
-  const preview2 = store.get(key);
-  assert.ok(preview2);
-  assert.equal(preview2.pageTitle, "Glance Version 2");
-  assert.ok(preview2.savedAt > savedAt1);
-});
-
-test("P1-T7: Remote target changed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
-  const store = new Map();
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, "https://nas-a.5ddd.com/");
-
-  const settings = { targetUrl: "https://nas-b.5ddd.com/" };
-  const renderedRemoteTarget = "https://nas-a.5ddd.com/";
-  const lanAccessResult = { targetUrl: "http://192.168.1.10:8080/" };
-  const renderedDeviceTarget = "http://192.168.1.10:8080/";
-
-  const remoteTarget = (settings.targetUrl ?? "").trim();
-  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
-  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
-  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
-
-  const remoteChanged = remoteTarget !== prevRemoteTarget;
-  const lanChanged = lanTarget !== prevLanTarget;
-
-  if (remoteChanged || lanChanged) {
-    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
-  }
-
-  assert.equal(remoteChanged, true);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
-});
-
-test("P1-T8: LAN target changed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
-  const store = new Map();
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
-
-  const settings = { targetUrl: "https://nas.5ddd.com/" };
-  const renderedRemoteTarget = "https://nas.5ddd.com/";
-  const lanAccessResult = { targetUrl: "http://192.168.1.20:8080/" };
-  const renderedDeviceTarget = "http://192.168.1.10:8080/";
-
-  const remoteTarget = (settings.targetUrl ?? "").trim();
-  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
-  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
-  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
-
-  const remoteChanged = remoteTarget !== prevRemoteTarget;
-  const lanChanged = lanTarget !== prevLanTarget;
-
-  if (remoteChanged || lanChanged) {
-    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
-  }
-
-  assert.equal(lanChanged, true);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
-});
-
-test("P1-T9: LAN target removed clears ACTIVE_PREVIEW_TARGET_KEY", async () => {
-  const store = new Map();
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
-
-  const settings = { targetUrl: "https://nas.5ddd.com/" };
-  const renderedRemoteTarget = "https://nas.5ddd.com/";
-  const lanAccessResult = { targetUrl: "" };
-  const renderedDeviceTarget = "http://192.168.1.10:8080/";
-
-  const remoteTarget = (settings.targetUrl ?? "").trim();
-  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
-  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
-  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
-
-  const remoteChanged = remoteTarget !== prevRemoteTarget;
-  const lanChanged = lanTarget !== prevLanTarget;
-
-  if (remoteChanged || lanChanged) {
-    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
-  }
-
-  assert.equal(lanChanged, true);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
-});
-
-test("P1-T10: Target unchanged preserves ACTIVE_PREVIEW_TARGET_KEY", async () => {
-  const store = new Map();
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, "http://192.168.1.10:8080/");
-
-  const settings = { targetUrl: "https://nas.5ddd.com/" };
-  const renderedRemoteTarget = "https://nas.5ddd.com/";
-  const lanAccessResult = { targetUrl: "http://192.168.1.10:8080/" };
-  const renderedDeviceTarget = "http://192.168.1.10:8080/";
-
-  const remoteTarget = (settings.targetUrl ?? "").trim();
-  const prevRemoteTarget = (renderedRemoteTarget ?? "").trim();
-  const lanTarget = (lanAccessResult.targetUrl ?? "").trim();
-  const prevLanTarget = (renderedDeviceTarget ?? "").trim();
-
-  const remoteChanged = remoteTarget !== prevRemoteTarget;
-  const lanChanged = lanTarget !== prevLanTarget;
-
-  if (remoteChanged || lanChanged) {
-    store.delete(ACTIVE_PREVIEW_TARGET_KEY);
-  }
-
-  assert.equal(remoteChanged, false);
-  assert.equal(lanChanged, false);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), true);
-});
-
-test("P1-T11: Old Preview entities are preserved when active pointer is cleared", async () => {
-  const store = new Map();
-  const keyA = previewStorageKey("https://nas-a.5ddd.com/");
-  store.set(keyA, { version: 1, pageTitle: "Preview A", savedAt: Date.now() });
-  store.set(ACTIVE_PREVIEW_TARGET_KEY, "https://nas-a.5ddd.com/");
-
-  // Switch to target B
-  store.delete(ACTIVE_PREVIEW_TARGET_KEY);
-
-  // Active target pointer is cleared, but Preview A entity is preserved
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
-  assert.equal(store.has(keyA), true);
-  assert.equal(store.get(keyA).pageTitle, "Preview A");
-});
-
-test("PT1: Non-target fnOS root does NOT save Preview or update active target pointer", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const hello = {
-    pending: null,
-    settings: {
-      enabled: true,
-      fnosRecoveryEnabled: true,
-      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
-    },
-    deviceRoute: {
-      targetUrl: "http://192.168.1.10:18080/"
-    }
-  };
-
-  const currentTabUrl = "https://demo-nas.5ddd.com/"; // fnOS root page
-  const directFailure = ""; // No invalid token on root
-  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl)
-    || isConfiguredTargetPage(hello.deviceRoute, currentTabUrl);
-
-  assert.equal(isConfiguredTarget, false);
-
-  // Content script execution simulation:
-  let previewScheduled = false;
-  if (!directFailure) {
-    if (isConfiguredTarget) {
-      previewScheduled = true;
-      await saveGlancePreviewToStorage(mockStorage, {}, currentTabUrl);
-    }
-  }
-
-  assert.equal(previewScheduled, false);
-  assert.equal(store.size, 0);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
-});
-
-test("PT2: Other same-domain non-target pages do NOT save Preview", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const hello = {
-    pending: null,
-    settings: {
-      enabled: true,
-      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
-    },
-    deviceRoute: {
-      targetUrl: "http://192.168.1.10:18080/"
-    }
-  };
-
-  const testUrls = [
-    "https://demo-nas.5ddd.com/settings",
-    "https://5ddd.com/demo-nas/",
-    "https://demo-nas.5ddd.com/files/",
-    "http://192.168.1.10:8000/" // different port, not Glance
-  ];
-
-  for (const url of testUrls) {
-    const isConfiguredTarget = isConfiguredTargetPage(hello.settings, url)
-      || isConfiguredTargetPage(hello.deviceRoute, url);
-    assert.equal(isConfiguredTarget, false);
-  }
-});
-
-test("PT3: pending=null learned LAN fast path integration schedules and saves Preview and updates pointer", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const lanTargetUrl = "http://192.168.1.10:18080/";
-  const hello = {
-    pending: null, // Fast path clears pending in background
-    settings: {
-      enabled: true,
-      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
-    },
-    deviceRoute: {
-      targetUrl: lanTargetUrl
-    }
-  };
-
-  const currentTabUrl = "http://192.168.1.10:18080/";
-  const directFailure = "";
-  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl)
-    || isConfiguredTargetPage(hello.deviceRoute, currentTabUrl);
-
-  assert.equal(isConfiguredTarget, true);
-
-  const mockDoc = {
-    title: "LAN Glance",
-    documentElement: { dataset: { theme: "auto" } },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{
-      querySelectorAll: () => [{
-        querySelector: (s) => {
-          if (s.includes("password") || s.includes("token")) return null;
-          return { textContent: "LAN Dashboard" };
-        },
-        querySelectorAll: () => []
-      }]
-    }]
-  };
-
-  let scheduled = false;
-  if (!directFailure && isConfiguredTarget) {
-    scheduled = true;
-    await saveGlancePreviewToStorage(mockStorage, mockDoc, currentTabUrl);
-  }
-
-  assert.equal(scheduled, true);
-  const key = previewStorageKey(lanTargetUrl);
-  assert.equal(store.has(key), true);
-  assert.equal(store.get(key).pageTitle, "LAN Glance");
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
-});
-
-test("PT4: pending=null remote/direct success integration schedules and saves Preview", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const remoteUrl = "https://demo-nas.5ddd.com/app/glance-homepage/";
-  const hello = {
-    pending: null,
-    settings: {
-      enabled: true,
-      targetUrl: remoteUrl
-    },
-    deviceRoute: null
-  };
-
-  const currentTabUrl = remoteUrl;
-  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl);
-  assert.equal(isConfiguredTarget, true);
-
-  const mockDoc = {
-    title: "Remote Glance Homepage",
-    documentElement: { dataset: { theme: "dark" } },
-    body: { classList: { contains: () => true } },
-    querySelectorAll: () => [{
-      querySelectorAll: () => [{
-        querySelector: (s) => {
-          if (s.includes("password")) return null;
-          return { textContent: "Widgets" };
-        },
-        querySelectorAll: () => []
-      }]
-    }]
-  };
-
-  await saveGlancePreviewToStorage(mockStorage, mockDoc, currentTabUrl);
-  assert.equal(store.has(previewStorageKey(remoteUrl)), true);
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://demo-nas.5ddd.com/app/glance-homepage/");
-});
-
-test("PT5: Configured target + auth failure does NOT save Preview", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const remoteUrl = "https://demo-nas.5ddd.com/app/glance-homepage/";
-  const directFailure = "invalid-token"; // Auth failure detected
-  const isConfiguredTarget = true;
-
-  let saved = false;
-  if (!directFailure && isConfiguredTarget) {
-    saved = true;
-    await saveGlancePreviewToStorage(mockStorage, {}, remoteUrl);
-  }
-
-  assert.equal(saved, false);
-  assert.equal(store.size, 0);
-});
-
-test("PT6: Fade does not await DOM extraction", (t, done) => {
-  const events = [];
-
-  // Simulate scheduler
-  function scheduleRefresh(cb) {
-    setTimeout(() => {
-      events.push("extraction_executed");
-      cb();
-    }, 15);
-  }
-
-  // Simulate main flow
-  function onVisualReady() {
-    events.push("visual_ready");
-    scheduleRefresh(() => {});
-    events.push("fade_started");
-  }
-
-  onVisualReady();
-
-  assert.deepEqual(events, ["visual_ready", "fade_started"]);
-  setTimeout(() => {
-    assert.deepEqual(events, ["visual_ready", "fade_started", "extraction_executed"]);
-    done();
-  }, 25);
-});
-
-test("PT7: schedulePreviewRefresh uses requestIdleCallback when available", (t, done) => {
-  let idleCalled = false;
-  const mockGlobal = {
-    requestIdleCallback(fn, opts) {
-      assert.equal(opts.timeout, 1000);
-      idleCalled = true;
-      fn();
-    }
-  };
-
-  schedulePreviewRefresh(() => {
-    assert.equal(idleCalled, true);
-    done();
-  }, mockGlobal);
-});
-
-test("PT8: schedulePreviewRefresh uses fallback scheduler when requestIdleCallback is undefined", (t, done) => {
-  let microtaskCalled = false;
-  let rafCalled = false;
-
-  const mockGlobal = {
-    requestIdleCallback: undefined,
-    queueMicrotask(fn) {
-      microtaskCalled = true;
-      fn();
-    },
-    requestAnimationFrame(fn) {
-      rafCalled = true;
-      fn();
-    }
-  };
-
-  schedulePreviewRefresh(() => {
-    assert.equal(microtaskCalled, true);
-    assert.equal(rafCalled, true);
-    done();
-  }, mockGlobal);
-});
-
-test("PT9: Preview storage reject does not affect fade, visual ready or trigger error UI", async () => {
-  const faultyStorage = {
-    async set() {
-      throw new Error("QuotaExceededError");
-    }
-  };
-
-  const mockDoc = {
-    title: "Glance",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: () => ({ textContent: "W" }), querySelectorAll: () => [] }] }]
-  };
-
-  let threw = false;
-  try {
-    const res = await saveGlancePreviewToStorage(faultyStorage, mockDoc, "https://glance.local/");
-    assert.equal(res, false);
-  } catch {
-    threw = true;
-  }
-  assert.equal(threw, false);
-});
-
-test("PT10: Preview content and savedAt are refreshed on consecutive configured target successes", async () => {
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const targetUrl = "https://nas.5ddd.com/glance/";
-  const docA = {
-    title: "Initial Glance",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "Card A" }), querySelectorAll: () => [] }] }]
-  };
-
-  await saveGlancePreviewToStorage(mockStorage, docA, targetUrl);
-  const key = previewStorageKey(targetUrl);
-  const prevA = store.get(key);
-  assert.equal(prevA.pageTitle, "Initial Glance");
-  const timeA = prevA.savedAt;
-
-  await new Promise((r) => setTimeout(r, 10));
-
-  const docB = {
-    title: "Updated Glance",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "Card B" }), querySelectorAll: () => [] }] }]
-  };
-
-  await saveGlancePreviewToStorage(mockStorage, docB, targetUrl);
-  const prevB = store.get(key);
-  assert.equal(prevB.pageTitle, "Updated Glance");
-  assert.ok(prevB.savedAt > timeA);
-});
-
-test("SEQ1: Normal configured target presentation strictly executes visual_ready -> doubleRAF -> fade -> preview schedule -> extraction", async () => {
-  const events = [];
-  const mockGlobal = {
-    requestAnimationFrame(fn) {
-      events.push("raf");
-      return setTimeout(fn, 1);
-    },
-    requestIdleCallback(fn) {
-      events.push("idle_callback_registered");
-      return setTimeout(() => {
-        events.push("extraction_started");
-        fn();
-      }, 5);
-    }
-  };
-
-  await finishTargetPresentation({
-    async waitForVisualReady() {
-      events.push("visual_ready");
-    },
-    async fadeOut() {
-      events.push("fade_started");
-      await new Promise((r) => setTimeout(r, 10));
-      events.push("fade_completed");
-    },
-    scheduleRefresh(url) {
-      events.push("preview_refresh_scheduled");
-      schedulePreviewRefresh(() => {
-        events.push("preview_saved");
-      }, mockGlobal);
-    },
-    targetUrl: "https://nas.5ddd.com/glance/",
-    isConfiguredTarget: true,
-    globalScope: mockGlobal
-  });
-
-  // At the moment finishTargetPresentation resolves, fade must already be complete, but extraction has NOT started yet
-  assert.deepEqual(events, [
-    "visual_ready",
-    "raf",
-    "raf",
-    "fade_started",
-    "fade_completed",
-    "preview_refresh_scheduled",
-    "idle_callback_registered"
-  ]);
-
-  // Wait for idle callback to fire
-  await new Promise((r) => setTimeout(r, 20));
-
-  assert.deepEqual(events, [
-    "visual_ready",
-    "raf",
-    "raf",
-    "fade_started",
-    "fade_completed",
-    "preview_refresh_scheduled",
-    "idle_callback_registered",
-    "extraction_started",
-    "preview_saved"
-  ]);
-});
-
-test("SEQ2: LAN fast path presentation executes fade to completion before scheduling preview refresh", async () => {
-  const events = [];
-  const store = new Map();
-  const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
-    }
-  };
-
-  const lanTargetUrl = "http://192.168.1.10:18080/";
-  const mockDoc = {
-    title: "LAN Glance",
-    documentElement: { dataset: {} },
-    body: { classList: { contains: () => false } },
-    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "LAN Card" }), querySelectorAll: () => [] }] }]
-  };
-
-  await finishTargetPresentation({
-    async waitForVisualReady() {
-      events.push("visual_ready");
-    },
-    async fadeOut() {
-      events.push("fade_started");
-      await new Promise((r) => setTimeout(r, 5));
-      events.push("fade_completed");
-    },
-    scheduleRefresh(url) {
-      events.push("schedule_refresh");
-      schedulePreviewRefresh(async () => {
-        events.push("preview_write_start");
-        await saveGlancePreviewToStorage(mockStorage, mockDoc, url);
-        events.push("preview_write_complete");
-      });
-    },
-    targetUrl: lanTargetUrl,
-    isConfiguredTarget: true
-  });
-
-  assert.equal(events.indexOf("fade_completed") < events.indexOf("schedule_refresh"), true);
-  await new Promise((r) => setTimeout(r, 15));
-  assert.equal(store.has(previewStorageKey(lanTargetUrl)), true);
-  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
-});
-
-test("SEQ3: Remote direct success presentation executes fade before preview refresh", async () => {
-  const events = [];
-  const remoteUrl = "https://demo.fnos.net/glance/";
-
-  await finishTargetPresentation({
-    async waitForVisualReady() {
-      events.push("visual_ready");
-    },
-    async fadeOut() {
-      events.push("fade_started");
-      events.push("fade_completed");
-    },
-    scheduleRefresh(url) {
-      events.push("schedule_refresh");
-    },
-    targetUrl: remoteUrl,
-    isConfiguredTarget: true
-  });
-
-  assert.deepEqual(events, [
-    "visual_ready",
-    "fade_started",
-    "fade_completed",
-    "schedule_refresh"
-  ]);
-});
-
-test("SEQ4: Pending target recovery success executes fade before preview refresh", async () => {
-  const events = [];
-  const recoveryUrl = "https://demo.fnos.net/app/glance/";
-
-  await finishTargetPresentation({
-    async waitForVisualReady() {
-      events.push("visual_ready");
-    },
-    async fadeOut() {
-      events.push("fade_started");
-      events.push("fade_completed");
-    },
-    scheduleRefresh(url) {
-      events.push("schedule_refresh");
-    },
-    targetUrl: recoveryUrl,
-    isConfiguredTarget: true
-  });
-
-  assert.deepEqual(events, [
-    "visual_ready",
-    "fade_started",
-    "fade_completed",
-    "schedule_refresh"
-  ]);
-});
-
-test("SEQ5: When no overlay exists, fade completes immediately without blocking", async () => {
-  let resolved = false;
-
-  // Simulate fadeOutLoadingOverlay when loadingHost is null
-  function fadeOutNoHost() {
-    return new Promise((resolve) => {
-      const loadingHost = null;
-      if (!loadingHost) {
-        resolve();
-      }
-    });
-  }
-
-  const start = Date.now();
-  await fadeOutNoHost();
-  resolved = true;
-  const elapsed = Date.now() - start;
-
-  assert.equal(resolved, true);
-  assert.ok(elapsed < 50);
-});
-
-test("SEQ6: Transitionend event triggers immediate fade promise resolution and cleanup", async () => {
+test("T6: Closed ShadowRoot Fade resolves via fallback timer when transitionend does not fire", async () => {
   let removed = false;
-  let transitionListener = null;
-
-  const mockScreen = {
-    style: {},
-    addEventListener(evt, fn) {
-      if (evt === "transitionend") transitionListener = fn;
-    },
-    removeEventListener(evt, fn) {
-      if (evt === "transitionend") transitionListener = null;
-    }
-  };
-
-  const mockHost = {
-    remove() {
-      removed = true;
-    }
-  };
-
-  function fadeWithTransitionEnd() {
-    return new Promise((resolve) => {
-      let finished = false;
-      let timerId = null;
-
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        if (timerId !== null) clearTimeout(timerId);
-        mockScreen.removeEventListener("transitionend", onTransitionEnd);
-        mockHost.remove();
-        resolve();
-      };
-
-      const onTransitionEnd = (e) => {
-        if (e.propertyName === "opacity") {
-          finish();
-        }
-      };
-
-      mockScreen.addEventListener("transitionend", onTransitionEnd);
-      mockScreen.style.transition = "opacity 140ms ease-out";
-      mockScreen.style.opacity = "0";
-      timerId = setTimeout(finish, 180);
-    });
-  }
-
-  const fadePromise = fadeWithTransitionEnd();
-  assert.ok(transitionListener);
-  assert.equal(mockScreen.style.opacity, "0");
-
-  // Dispatch transitionend early (e.g. after 10ms)
-  transitionListener({ propertyName: "opacity" });
-
-  await fadePromise;
-  assert.equal(removed, true);
-  assert.equal(transitionListener, null);
-});
-
-test("SEQ7: Transitionend fallback timer triggers safe resolve if transitionend does not fire", async () => {
-  let removed = false;
-
   const mockScreen = {
     style: {},
     addEventListener() {},
     removeEventListener() {}
   };
-
   const mockHost = {
-    remove() {
-      removed = true;
-    }
+    remove() { removed = true; }
   };
 
   function fadeWithFallback() {
     return new Promise((resolve) => {
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
+      mockScreen.style.opacity = "0";
+      setTimeout(() => {
         mockHost.remove();
         resolve();
-      };
-      setTimeout(finish, 20); // shortened for test
+      }, 30);
     });
   }
 
@@ -2703,75 +1465,67 @@ test("SEQ7: Transitionend fallback timer triggers safe resolve if transitionend 
   assert.equal(removed, true);
 });
 
-test("SEQ8: Heavy DOM extraction task never executes before fade_started or fade_completed", async () => {
-  const timeline = [];
+test("T7: Missing screen or missing host fallback safely resolves without uncaught errors", () => {
+  let loadingHost = { removed: false, remove() { this.removed = true; } };
+  let loadingScreen = null;
+
+  let completed = false;
+  function fadeOut(cb) {
+    if (!loadingHost) { cb?.(); return; }
+    loadingHost.remove();
+    loadingHost = null;
+    loadingScreen = null;
+    cb?.();
+  }
+
+  fadeOut(() => { completed = true; });
+  assert.equal(completed, true);
+  assert.equal(loadingHost, null);
+});
+
+test("T8: finishTargetPresentation executes visual ready, double requestAnimationFrame, and fadeOut", async () => {
+  const steps = [];
 
   const mockGlobal = {
-    requestIdleCallback(fn) {
-      setTimeout(() => {
-        timeline.push("heavy_extraction_start");
-        // Simulate heavy extraction
-        for (let i = 0; i < 1000; i++) {}
-        timeline.push("heavy_extraction_end");
-        fn();
-      }, 10);
+    requestAnimationFrame(fn) {
+      steps.push("raf");
+      fn();
     }
   };
 
   await finishTargetPresentation({
     async waitForVisualReady() {
-      timeline.push("visual_ready");
+      steps.push("visual_ready");
     },
     async fadeOut() {
-      timeline.push("fade_started");
-      await new Promise((r) => setTimeout(r, 5));
-      timeline.push("fade_completed");
+      steps.push("fade_out");
     },
-    scheduleRefresh(url) {
-      timeline.push("schedule_refresh");
-      schedulePreviewRefresh(() => {}, mockGlobal);
-    },
-    targetUrl: "https://nas.5ddd.com/",
-    isConfiguredTarget: true,
     globalScope: mockGlobal
   });
 
-  assert.equal(timeline.indexOf("fade_completed") < timeline.indexOf("schedule_refresh"), true);
-
-  await new Promise((r) => setTimeout(r, 25));
-
-  assert.ok(timeline.indexOf("heavy_extraction_start") > timeline.indexOf("fade_completed"));
+  assert.deepEqual(steps, ["visual_ready", "raf", "raf", "fade_out"]);
 });
 
-test("SEQ9: Preview storage reject after fade does not crash presentation", async () => {
-  const faultyStorage = {
-    async set() {
-      throw new Error("QuotaExceededError");
-    }
-  };
+test("T9: Synchronous document_start overlay layout exists and is pure loading UI without fake preview DOM", () => {
+  const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
+  assert.ok(contentJs.includes("ensureLoadingOverlay();"));
+  assert.ok(contentJs.includes("正在载入 Glance"));
+  assert.equal(contentJs.includes("preview-layer"), false);
+  assert.equal(contentJs.includes("glance-preview-layout"), false);
+  assert.equal(contentJs.includes("renderGlanceSkeletonHtml"), false);
+  assert.equal(contentJs.includes("extractGlancePreview"), false);
+});
 
-  let presentationFinished = false;
-  let saveFailedCaught = false;
+test("T10: Newtab lightweight loading markup contains clean status card without preview container", () => {
+  const newtabHtml = fs.readFileSync(new URL("../newtab.html", import.meta.url), "utf8");
+  assert.equal(newtabHtml.includes("preview-container"), false);
+  assert.ok(newtabHtml.includes('id="status-card"'));
+  assert.ok(newtabHtml.includes("正在打开主页"));
 
-  await finishTargetPresentation({
-    async fadeOut() {
-      presentationFinished = true;
-    },
-    scheduleRefresh(url) {
-      schedulePreviewRefresh(async () => {
-        const ok = await saveGlancePreviewToStorage(faultyStorage, {}, url);
-        if (!ok) {
-          saveFailedCaught = true;
-        }
-      });
-    },
-    targetUrl: "https://nas.5ddd.com/",
-    isConfiguredTarget: true
-  });
-
-  assert.equal(presentationFinished, true);
-  await new Promise((r) => setTimeout(r, 10));
-  assert.equal(saveFailedCaught, true);
+  const newtabJs = fs.readFileSync(new URL("../newtab.js", import.meta.url), "utf8");
+  assert.equal(newtabJs.includes("renderGlancePreviewHtml"), false);
+  assert.equal(newtabJs.includes("renderGlanceSkeletonHtml"), false);
+  assert.equal(newtabJs.includes("previewStorageKey"), false);
 });
 
 test("BOOT1: Bootstrap official automatic redirection succeeds without triggering fallback", async () => {
@@ -3095,35 +1849,28 @@ test("BOOT9: Fallback to root does not bypass auth failure and respects login pr
   assert.equal(manager.getPending(tabId).phase, "root");
 });
 
-test("BOOT10: Neither bootstrap nor fallback root page pollutes Preview cache", async () => {
+test("BOOT10: Legacy preview cleanup cleans up any stale preview data on upgrade", async () => {
   const store = new Map();
+  store.set("glance-preview:https://demo-nas.5ddd.com/app/glance/", { theme: "auto" });
+  store.set("glance-preview-active-target", "https://demo-nas.5ddd.com/app/glance/");
+  store.set("lan-route:https://demo-nas.5ddd.com/", { targetUrl: "http://192.168.1.10:8080/" });
+
   const mockStorage = {
-    async set(items) {
-      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
     }
   };
 
-  const configuredTarget = "https://demo-nas.5ddd.com/app/glance/";
-  const bootstrapUrl = "https://5ddd.com/demo-nas/";
-  const rootUrl = "https://demo-nas.5ddd.com/";
-
-  // Check configured target matches
-  assert.equal(isConfiguredTargetPage({ targetUrl: configuredTarget }, bootstrapUrl), false);
-  assert.equal(isConfiguredTargetPage({ targetUrl: configuredTarget }, rootUrl), false);
-
-  // Preview extraction attempted on bootstrap or root page returns false/not executed
-  const isTargetForBootstrap = isConfiguredTargetPage({ targetUrl: configuredTarget }, bootstrapUrl);
-  if (isTargetForBootstrap) {
-    await saveGlancePreviewToStorage(mockStorage, {}, bootstrapUrl);
-  }
-
-  const isTargetForRoot = isConfiguredTargetPage({ targetUrl: configuredTarget }, rootUrl);
-  if (isTargetForRoot) {
-    await saveGlancePreviewToStorage(mockStorage, {}, rootUrl);
-  }
-
-  assert.equal(store.size, 0);
-  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+  await cleanupLegacyPreviewStorage(mockStorage);
+  assert.equal(store.has("glance-preview:https://demo-nas.5ddd.com/app/glance/"), false);
+  assert.equal(store.has("glance-preview-active-target"), false);
+  assert.equal(store.has("lan-route:https://demo-nas.5ddd.com/"), true);
 });
 
 

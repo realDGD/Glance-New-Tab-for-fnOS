@@ -24,8 +24,6 @@
   let loadingScreen;
   let loadingText;
   let loadingButton;
-  let previewLayer;
-  let promptCard;
   let loadingManuallyDismissed = false;
   let stopped = false;
   let probeSequence = 0;
@@ -211,307 +209,6 @@
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
   }
 
-  const PREVIEW_KEY_PREFIX = "glance-preview:";
-  const ACTIVE_PREVIEW_TARGET_KEY = "glance-preview-active-target";
-  const PREVIEW_TTL_FRESH_MS = 30 * 60 * 1000;
-  const PREVIEW_TTL_STALE_MS = 6 * 60 * 60 * 1000;
-
-  const SENSITIVE_QUERY_KEYS = new Set([
-    "token", "access_token", "refresh_token", "auth", "auth_token",
-    "authorization", "key", "api_key", "apikey", "secret", "session",
-    "sessionid", "sid", "ticket", "sig", "signature", "code", "jwt",
-    "credential", "credentials", "password", "passwd", "pwd"
-  ]);
-
-  function normalizeNavigableUrl(value) {
-    const parsed = new URL(value);
-    if (!new Set(["http:", "https:"]).has(parsed.protocol)) {
-      throw new Error("只支持 HTTP 或 HTTPS 网址");
-    }
-    parsed.hash = "";
-    if (parsed.pathname.length > 1) {
-      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    }
-    return parsed.href;
-  }
-
-  function previewStorageKey(targetUrl) {
-    const norm = normalizeNavigableUrl(targetUrl);
-    const parsed = new URL(norm);
-    if (parsed.pathname.length > 1) {
-      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    }
-    return `${PREVIEW_KEY_PREFIX}${parsed.href}`;
-  }
-
-  function sanitizeSafeUrl(rawUrl) {
-    if (!rawUrl || typeof rawUrl !== "string") {
-      return "";
-    }
-    try {
-      const parsed = new URL(rawUrl, "https://glance.local");
-      for (const key of [...parsed.searchParams.keys()]) {
-        if (SENSITIVE_QUERY_KEYS.has(key.toLowerCase())) {
-          parsed.searchParams.delete(key);
-        }
-      }
-      const lowerHash = parsed.hash.toLowerCase();
-      for (const key of SENSITIVE_QUERY_KEYS) {
-        if (lowerHash.includes(key)) {
-          parsed.hash = "";
-          break;
-        }
-      }
-      return parsed.href;
-    } catch {
-      return "";
-    }
-  }
-
-  function sanitizeSafeText(text, maxLength = 80) {
-    if (!text || typeof text !== "string") {
-      return "";
-    }
-    const clean = text.replace(/[\x00-\x1F\x7F-\x9F]/g, " ").trim();
-    if (/\b(?:bearer\s+[a-zA-Z\d._-]+|access_token|password\s*=|secret\s*=)/i.test(clean)) {
-      return "";
-    }
-    return clean.slice(0, maxLength);
-  }
-
-  function escapeHtml(str) {
-    return String(str ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
-
-  function getPreviewStatus(preview) {
-    if (!preview || typeof preview !== "object" || !preview.savedAt) {
-      return "none";
-    }
-    const age = Date.now() - preview.savedAt;
-    if (age < PREVIEW_TTL_FRESH_MS) {
-      return "fresh";
-    }
-    if (age < PREVIEW_TTL_STALE_MS) {
-      return "stale";
-    }
-    return "expired";
-  }
-
-  function renderGlanceSkeletonHtml() {
-    return `
-      <div class="glance-preview-layout skeleton-layout" aria-hidden="true">
-        <div class="glance-preview-header">
-          <div class="glance-skeleton-bar glance-skeleton-title"></div>
-          <div class="glance-skeleton-bar glance-skeleton-time"></div>
-        </div>
-        <div class="glance-preview-columns">
-          <div class="glance-preview-col">
-            <div class="glance-preview-card skeleton-card">
-              <div class="glance-skeleton-bar card-title"></div>
-              <div class="glance-skeleton-bar card-line"></div>
-              <div class="glance-skeleton-bar card-line short"></div>
-            </div>
-            <div class="glance-preview-card skeleton-card">
-              <div class="glance-skeleton-bar card-title"></div>
-              <div class="glance-skeleton-bar card-line"></div>
-            </div>
-          </div>
-          <div class="glance-preview-col">
-            <div class="glance-preview-card skeleton-card">
-              <div class="glance-skeleton-bar card-title"></div>
-              <div class="glance-skeleton-bar card-line"></div>
-              <div class="glance-skeleton-bar card-line"></div>
-            </div>
-          </div>
-          <div class="glance-preview-col">
-            <div class="glance-preview-card skeleton-card">
-              <div class="glance-skeleton-bar card-title"></div>
-              <div class="glance-skeleton-bar card-line short"></div>
-            </div>
-            <div class="glance-preview-card skeleton-card">
-              <div class="glance-skeleton-bar card-title"></div>
-              <div class="glance-skeleton-bar card-line"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  function renderGlancePreviewHtml(preview, status = "fresh") {
-    if (!preview || !Array.isArray(preview.columns) || preview.columns.length === 0) {
-      return renderGlanceSkeletonHtml();
-    }
-    const staleNotice = status === "stale"
-      ? `<div class="glance-preview-stale-badge">缓存预览 · 正在刷新</div>`
-      : "";
-
-    const columnsHtml = preview.columns.map((col) => {
-      const widgetsHtml = (col.widgets || []).map((w) => {
-        const titleHtml = w.title ? `<div class="glance-card-header">${escapeHtml(w.title)}</div>` : "";
-        const itemsHtml = (w.items || []).map((item) => `
-          <div class="glance-card-item">
-            <span class="glance-card-item-title">${escapeHtml(item.title)}</span>
-          </div>
-        `).join("");
-        return `
-          <div class="glance-preview-card">
-            ${titleHtml}
-            <div class="glance-card-body">${itemsHtml}</div>
-          </div>
-        `;
-      }).join("");
-      return `<div class="glance-preview-col">${widgetsHtml}</div>`;
-    }).join("");
-
-    return `
-      <div class="glance-preview-layout" aria-hidden="true">
-        <div class="glance-preview-header">
-          <div class="glance-preview-title">${escapeHtml(preview.pageTitle || "Glance")}</div>
-          ${staleNotice}
-        </div>
-        <div class="glance-preview-columns">
-          ${columnsHtml}
-        </div>
-      </div>
-    `;
-  }
-
-  function extractGlancePreview(rootDocument, targetUrl) {
-    if (!rootDocument || typeof rootDocument.querySelectorAll !== "function") {
-      return null;
-    }
-    try {
-      const title = sanitizeSafeText(rootDocument.title || "Glance", 60);
-      const theme = rootDocument.documentElement?.dataset?.theme
-        || (rootDocument.body?.classList?.contains("dark") ? "dark" : "auto");
-
-      const columnElements = rootDocument.querySelectorAll(".column, [class*='column'], .grid-col");
-      const columns = [];
-
-      const isExtensionOverlay = (el) => {
-        try {
-          return el && (el.id === "keep-fnnas-login-loading"
-            || (typeof el.closest === "function" && Boolean(el.closest("#keep-fnnas-login-loading"))));
-        } catch {
-          return false;
-        }
-      };
-
-      const processWidget = (widgetEl) => {
-        if (isExtensionOverlay(widgetEl)) {
-          return null;
-        }
-        if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i], input[name*="auth" i], input[type="hidden"], textarea, form')) {
-          return null;
-        }
-
-        const titleEl = typeof widgetEl.querySelector === "function" ? widgetEl.querySelector("h1, h2, h3, h4, h5, h6, .title, [class*='title']") : null;
-        const widgetTitle = sanitizeSafeText(titleEl?.textContent || "", 50);
-
-        const itemEls = typeof widgetEl.querySelectorAll === "function" ? widgetEl.querySelectorAll("li, a, .item, [class*='item']") : [];
-        const items = [];
-        for (const itemEl of Array.from(itemEls).slice(0, 12)) {
-          const itemText = sanitizeSafeText(itemEl.textContent || "", 60);
-          if (itemText) {
-            const linkHref = itemEl.tagName === "A"
-              ? itemEl.getAttribute?.("href")
-              : (typeof itemEl.querySelector === "function" ? itemEl.querySelector("a")?.getAttribute?.("href") : null);
-            items.push({
-              title: itemText,
-              url: linkHref ? sanitizeSafeUrl(linkHref) : ""
-            });
-          }
-        }
-
-        return {
-          title: widgetTitle,
-          items: items.length > 0 ? items : []
-        };
-      };
-
-      if (columnElements.length > 0) {
-        for (const colEl of Array.from(columnElements).slice(0, 4)) {
-          if (isExtensionOverlay(colEl)) {
-            continue;
-          }
-          const widgetEls = colEl.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
-          const widgets = [];
-          for (const w of Array.from(widgetEls).slice(0, 8)) {
-            const parsed = processWidget(w);
-            if (parsed) widgets.push(parsed);
-          }
-          if (widgets.length > 0) {
-            columns.push({ widgets });
-          }
-        }
-      } else {
-        const widgetEls = rootDocument.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
-        const widgets = [];
-        for (const w of Array.from(widgetEls).slice(0, 16)) {
-          const parsed = processWidget(w);
-          if (parsed) widgets.push(parsed);
-        }
-        if (widgets.length > 0) {
-          columns.push({ widgets });
-        }
-      }
-
-      return {
-        version: 1,
-        savedAt: Date.now(),
-        targetUrl: normalizeNavigableUrl(targetUrl),
-        theme,
-        pageTitle: title,
-        columns
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  async function saveCurrentGlancePreview(targetUrl = location.href) {
-    try {
-      if (pageAuthenticationFailure() || pageContainsLoginForm()) {
-        return false;
-      }
-      const preview = extractGlancePreview(document, targetUrl);
-      if (preview && Array.isArray(preview.columns) && preview.columns.length > 0) {
-        const key = previewStorageKey(targetUrl);
-        const normTarget = normalizeNavigableUrl(targetUrl);
-        await chrome.storage.local.set({
-          [key]: preview,
-          [ACTIVE_PREVIEW_TARGET_KEY]: normTarget
-        });
-        return true;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  function schedulePreviewRefresh(targetUrl = location.href) {
-    const run = () => {
-      void saveCurrentGlancePreview(targetUrl);
-    };
-    if (typeof window.requestIdleCallback === "function") {
-      window.requestIdleCallback(run, { timeout: 1000 });
-    } else {
-      queueMicrotask(() => {
-        window.requestAnimationFrame(run);
-      });
-    }
-  }
-
-  let previewLayer = null;
-  let promptCard = null;
-
   function ensureLoadingOverlay(settings = null) {
     if (loadingHost || !document.documentElement) {
       return;
@@ -546,117 +243,9 @@
           radial-gradient(circle at 82% 86%, rgba(56,198,165,.13), transparent 32rem),
           #0e1420;
       }
-      .preview-layer {
-        width: 100vw;
-        min-height: 100vh;
-        padding: 2.5rem 3.5rem;
-        box-sizing: border-box;
-      }
-      .glance-preview-layout {
-        max-width: 1400px;
-        margin: 0 auto;
-        display: flex;
-        flex-direction: column;
-        gap: 1.5rem;
-      }
-      .glance-preview-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.5rem 0;
-      }
-      .glance-preview-title {
-        font-size: 1.75rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-      }
-      .glance-preview-stale-badge {
-        font-size: 0.8rem;
-        font-weight: 500;
-        padding: 0.25rem 0.65rem;
-        border-radius: 9999px;
-        background: rgba(43, 111, 244, 0.12);
-        color: #2b6ff4;
-        border: 1px solid rgba(43, 111, 244, 0.2);
-      }
-      .screen.dark .glance-preview-stale-badge {
-        background: rgba(43, 111, 244, 0.2);
-        color: #8cb3ff;
-      }
-      .glance-preview-columns {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 1.5rem;
-        align-items: start;
-      }
-      .glance-preview-col {
-        display: flex;
-        flex-direction: column;
-        gap: 1.25rem;
-      }
-      .glance-preview-card {
-        border: 1px solid rgba(44, 62, 92, 0.1);
-        border-radius: 1rem;
-        background: rgba(255, 255, 255, 0.85);
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.04);
-        padding: 1.25rem 1.35rem;
-        backdrop-filter: blur(12px);
-        display: flex;
-        flex-direction: column;
-        gap: 0.85rem;
-      }
-      .screen.dark .glance-preview-card {
-        border-color: rgba(190, 208, 240, 0.1);
-        background: rgba(22, 29, 43, 0.8);
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-      }
-      .glance-card-header {
-        font-size: 1.05rem;
-        font-weight: 650;
-        color: #162033;
-      }
-      .screen.dark .glance-card-header {
-        color: #eef3ff;
-      }
-      .glance-card-body {
-        display: flex;
-        flex-direction: column;
-        gap: 0.5rem;
-      }
-      .glance-card-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.35rem 0;
-        border-bottom: 1px solid rgba(44, 62, 92, 0.06);
-        font-size: 0.9rem;
-        color: #4b5870;
-      }
-      .screen.dark .glance-card-item {
-        border-bottom-color: rgba(190, 208, 240, 0.08);
-        color: #aebad0;
-      }
-      .glance-skeleton-bar {
-        background: linear-gradient(90deg, rgba(44, 62, 92, 0.06) 25%, rgba(44, 62, 92, 0.12) 50%, rgba(44, 62, 92, 0.06) 75%);
-        background-size: 200% 100%;
-        animation: shimmer 1.8s infinite;
-        border-radius: 6px;
-      }
-      .screen.dark .glance-skeleton-bar {
-        background: linear-gradient(90deg, rgba(190, 208, 240, 0.06) 25%, rgba(190, 208, 240, 0.12) 50%, rgba(190, 208, 240, 0.06) 75%);
-        background-size: 200% 100%;
-      }
-      .glance-skeleton-title { width: 140px; height: 28px; }
-      .glance-skeleton-time { width: 80px; height: 20px; }
-      .skeleton-card .card-title { width: 50%; height: 18px; margin-bottom: 0.5rem; }
-      .skeleton-card .card-line { width: 90%; height: 14px; }
-      .skeleton-card .card-line.short { width: 60%; }
-      @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-
       .card {
-        display: none;
         width: min(440px, calc(100vw - 44px));
-        margin: 15vh auto 0;
+        margin: 18vh auto 0;
         padding: 42px 34px 34px;
         text-align: center;
         pointer-events: auto;
@@ -684,11 +273,7 @@
     const screen = document.createElement("div");
     screen.className = `screen${useDarkTheme(settings) ? " dark" : ""}`;
 
-    previewLayer = document.createElement("div");
-    previewLayer.className = "preview-layer";
-    previewLayer.innerHTML = renderGlanceSkeletonHtml();
-
-    promptCard = document.createElement("div");
+    const promptCard = document.createElement("div");
     promptCard.className = "card";
     const animation = document.createElement("div");
     animation.className = "animation";
@@ -718,34 +303,12 @@
     });
 
     promptCard.append(animation, title, loadingText, dots, loadingButton);
-    screen.append(previewLayer, promptCard);
+    screen.append(promptCard);
     shadow.append(style, screen);
     host.style.setProperty("all", "initial", "important");
     document.documentElement.append(host);
     loadingHost = host;
     loadingScreen = screen;
-
-    // Asynchronously check storage for current location preview ONLY (no cross-target fallback)
-    void (async () => {
-      try {
-        const curKey = previewStorageKey(location.href);
-        const stored = await chrome.storage.local.get([curKey]);
-        const preview = stored?.[curKey];
-        if (preview && previewLayer && (!promptCard || promptCard.style.display === "none" || !promptCard.style.display)) {
-          const status = getPreviewStatus(preview);
-          if (status === "fresh" || status === "stale") {
-            if (preview.theme === "dark") {
-              screen.classList.add("dark");
-            } else if (preview.theme === "light") {
-              screen.classList.remove("dark");
-            }
-            previewLayer.innerHTML = renderGlancePreviewHtml(preview, status);
-          }
-        }
-      } catch {
-        // Keep skeleton
-      }
-    })();
   }
 
   function setLoading(message, settings, showPageButton = false) {
@@ -754,12 +317,6 @@
     }
     removeBadge();
     ensureLoadingOverlay(settings);
-    if (previewLayer) {
-      previewLayer.style.display = "none";
-    }
-    if (promptCard) {
-      promptCard.style.display = "block";
-    }
     if (loadingText) {
       loadingText.textContent = message;
     }
@@ -776,8 +333,6 @@
     loadingScreen = null;
     loadingText = null;
     loadingButton = null;
-    previewLayer = null;
-    promptCard = null;
   }
 
   function fadeOutLoadingOverlay(onComplete = null) {
@@ -1449,9 +1004,6 @@
         window.requestAnimationFrame(resolve);
       }));
       await fadeOutLoadingOverlay();
-      if (isConfiguredTarget) {
-        schedulePreviewRefresh(location.href);
-      }
     }
   }
 
@@ -1466,7 +1018,7 @@
     }
   });
 
-  // Synchronously initialize the Preview / Skeleton overlay at document_start
+  // Synchronously initialize the Loading Overlay at document_start
   ensureLoadingOverlay();
 
   void main();
