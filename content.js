@@ -8,6 +8,7 @@
   const DOCKER_FAST_READY_STABILITY_MS = 300;
   const DOCKER_BOOTSTRAP_MIN_ROOT_DWELL_MS = 500;
   const DOCKER_BOOTSTRAP_READY_STABILITY_MS = 250;
+  const DOCKER_OPTIMISTIC_TARGET_GRACE_MS = 300;
   const DOCKER_BOOTSTRAP_FALLBACK_GRACE_MS = 1600;
   const DOCKER_MIN_ROOT_DWELL_MS = 2200;
   const DOCKER_READY_STABILITY_MS = 1000;
@@ -773,6 +774,12 @@
     let probeAgainRequested = false;
     let nextProbeTimer = null;
 
+    const timing = {
+      rootEnteredAt: Number(pending.rootEnteredAt ?? Date.now()),
+      backgroundReadyAt: 0,
+      frameReadyAt: 0
+    };
+
     function handleRuntimeMessage(message) {
       if (stopped) {
         return;
@@ -865,11 +872,23 @@
         return;
       }
 
-      const isReady = dockerRecovery
-        ? Boolean(result?.strongReady)
-        : Boolean(result?.ok);
+      const now = Date.now();
+      const backgroundReady = Boolean(result?.backgroundReady ?? result?.ok);
+      const frameReady = Boolean(result?.frameReady);
+      const strongReady = Boolean(result?.strongReady ?? (backgroundReady && frameReady));
+      const strictMode = Boolean(pending.strictRecovery || pending.optimisticTargetAttempted);
 
-      if (isReady) {
+      if (!timing.backgroundReadyAt && backgroundReady) {
+        timing.backgroundReadyAt = now;
+      }
+      if (!timing.frameReadyAt && frameReady) {
+        timing.frameReadyAt = now;
+      }
+
+      // Level 1: Confirmed Ready (strongReady is true, or native fnOS result.ok)
+      const isConfirmedReady = dockerRecovery ? strongReady : Boolean(result?.ok);
+
+      if (isConfirmedReady) {
         if (pending.phase === "manual") {
           showManualLogin(
             dockerRecovery
@@ -880,7 +899,6 @@
           return;
         }
         if (dockerRecovery) {
-          const now = Date.now();
           const minimumRootDwellMs = officialBootstrapCompleted
             ? DOCKER_BOOTSTRAP_MIN_ROOT_DWELL_MS
             : DOCKER_FAST_MIN_ROOT_DWELL_MS;
@@ -919,9 +937,12 @@
         }
         navigationRequested = true;
         setLoading("fnOS 登录已恢复，正在打开 Glance…", settings);
+        console.debug(
+          `[FNOS timing] root complete +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready +${timing.frameReadyAt ? timing.frameReadyAt - timing.rootEnteredAt : "none"}ms | confirmed target +${now - timing.rootEnteredAt}ms`
+        );
         const response = await send({
           type: "AUTH_READY",
-          via: result.via
+          via: "confirmed"
         });
         if (response?.action === "navigating") {
           stopped = true;
@@ -932,9 +953,49 @@
         return;
       }
 
+      // Level 2: Optimistic Ready (officialRootComplete && backgroundReady && !strictMode)
+      if (dockerRecovery && !strictMode && officialBootstrapCompleted && backgroundReady) {
+        const rootElapsed = now - Number(pending.rootEnteredAt ?? now);
+        if (rootElapsed >= DOCKER_OPTIMISTIC_TARGET_GRACE_MS) {
+          if (navigationRequested) {
+            return;
+          }
+          navigationRequested = true;
+          setLoading("fnOS 登录已恢复，正在快速打开 Glance…", settings);
+          console.debug(
+            `[FNOS timing] root complete +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready pending | optimistic target +${now - timing.rootEnteredAt}ms`
+          );
+          const response = await send({
+            type: "AUTH_READY",
+            via: "optimistic"
+          });
+          if (response?.action === "navigating") {
+            stopped = true;
+            cleanupProbeResources();
+          } else {
+            navigationRequested = false;
+          }
+          return;
+        }
+
+        const remainingGrace = DOCKER_OPTIMISTIC_TARGET_GRACE_MS - rootElapsed;
+        if (remainingGrace > 0) {
+          setLoading("fnOS 登录已恢复，正在快速确认 Docker 服务…", settings);
+          if (nextProbeTimer) {
+            window.clearTimeout(nextProbeTimer);
+          }
+          nextProbeTimer = window.setTimeout(() => {
+            nextProbeTimer = null;
+            void probeNow();
+          }, remainingGrace);
+          return;
+        }
+      }
+
+      // Level 3: Unready / waiting for health or frame in strictMode
       if (dockerRecovery) {
         dockerHealthReadyAt = 0;
-        if (result?.ok) {
+        if (backgroundReady) {
           setLoading(
             "fnOS 会话已恢复，正在等待 FN Connect 完成 Docker 服务授权…",
             settings

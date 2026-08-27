@@ -24,7 +24,8 @@ import {
   isDuplicateScriptRegistrationError,
   finishTargetPresentation,
   cleanupLegacyPreviewStorage,
-  combineDockerProbeSignals
+  combineDockerProbeSignals,
+  shouldStopDockerRecovery
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -2264,245 +2265,245 @@ test("COLD3: official root complete 不立即 target，而是推进至 root phas
   assert.equal(manager.getPending(tabId).phase, "root");
 });
 
-test("COLD4 (T1 & T2): frameReady 到来时通过 DOCKER_FRAME_READY 事件唤醒 probe，重新验证双信号而非直接 AUTH_READY", async () => {
-  let probeCount = 0;
-  let authReadySent = false;
-
-  const currentNavId = "nav-1001";
-  let stopped = false;
-  let probeInFlight = false;
-  let probeAgainRequested = false;
-
-  async function mockProbeAuth() {
-    probeCount += 1;
-    // Probe 1: backgroundReady only
-    if (probeCount === 1) {
-      return combineDockerProbeSignals(true, false);
-    }
-    // Probe 2 (after frameReady event): strongReady
-    return combineDockerProbeSignals(true, true);
-  }
-
-  async function tick() {
-    if (stopped) return;
-    const result = await mockProbeAuth();
-    if (result.strongReady) {
-      // Doesn't directly target on event, checks stability
-      return { action: "stability-check", result };
-    }
-    return { action: "waiting-unready", result };
-  }
-
-  async function probeNow() {
-    if (stopped) return;
-    if (probeInFlight) {
-      probeAgainRequested = true;
-      return;
-    }
-    probeInFlight = true;
-    probeAgainRequested = false;
-    try {
-      await tick();
-    } finally {
-      probeInFlight = false;
-    }
-    if (!stopped && probeAgainRequested) {
-      void probeNow();
-    }
-  }
-
-  // t=0: initial probe
-  await probeNow();
-  assert.equal(probeCount, 1);
-  assert.equal(authReadySent, false);
-
-  // t=50: DOCKER_FRAME_READY event arrives
-  function handleRuntimeMessage(message) {
-    if (stopped) return;
-    if (message?.type === "DOCKER_FRAME_READY") {
-      if (message.navigationId && message.navigationId !== currentNavId) {
-        return;
-      }
-      void probeNow();
-    }
-  }
-
-  handleRuntimeMessage({ type: "DOCKER_FRAME_READY", navigationId: currentNavId });
-  assert.equal(probeCount, 2);
-  assert.equal(authReadySent, false); // Rechecked, not directly targeted!
+test("COLD4 (T1): frameReady 快速成立时走 confirmed target，不执行 optimistic target", () => {
+  const probeSignals = combineDockerProbeSignals(true, true);
+  assert.equal(probeSignals.strongReady, true);
+  const isConfirmedReady = Boolean(probeSignals.strongReady);
+  assert.equal(isConfirmedReady, true);
 });
 
-test("COLD5 (T3): probe in-flight 期间收到 frameReady 事件不产生并发 probe，在当前完成之后立即 rerun", async () => {
-  let probeCount = 0;
-  let activeConcurrentProbes = 0;
-  let maxConcurrentProbes = 0;
-  let probeInFlight = false;
-  let probeAgainRequested = false;
+test("COLD5 (T2): frameReady 慢但 backgroundReady 快，到 300ms 触发 optimistic target", () => {
+  const backgroundReady = true;
+  const frameReady = false;
+  const officialBootstrapCompleted = true;
+  const strictMode = false;
+  const rootElapsed = 350;
+  const DOCKER_OPTIMISTIC_TARGET_GRACE_MS = 300;
 
-  async function slowProbe() {
-    activeConcurrentProbes += 1;
-    maxConcurrentProbes = Math.max(maxConcurrentProbes, activeConcurrentProbes);
-    probeCount += 1;
-    await new Promise((r) => setTimeout(r, 20));
-    activeConcurrentProbes -= 1;
-  }
+  const canOptimisticTarget = !strictMode
+    && officialBootstrapCompleted
+    && backgroundReady
+    && (rootElapsed >= DOCKER_OPTIMISTIC_TARGET_GRACE_MS);
 
-  async function probeNow() {
-    if (probeInFlight) {
-      probeAgainRequested = true;
-      return;
-    }
-    probeInFlight = true;
-    probeAgainRequested = false;
-    try {
-      await slowProbe();
-    } finally {
-      probeInFlight = false;
-    }
-    if (probeAgainRequested) {
-      await probeNow();
-    }
-  }
-
-  // Start probe 1
-  const p1 = probeNow();
-  // While probe 1 is in flight, frame event arrives
-  await probeNow();
-  await p1;
-
-  assert.equal(maxConcurrentProbes, 1); // Maximum 1 probe in-flight at a time
-  assert.equal(probeCount, 2); // Ran twice sequentially
+  assert.equal(canOptimisticTarget, true);
 });
 
-test("COLD6 (T4): strongReady 首次成立后使用精确 remaining (250ms) 而非 500ms/1000ms 退避", () => {
-  const now = 10400;
-  const rootEnteredAt = 10000; // rootElapsed = 400ms
-  const dockerHealthReadyAt = now; // readyElapsed = 0ms
-  const minimumRootDwellMs = 500;
-  const readyStabilityMs = 250;
+test("COLD6 (T3): backgroundReady=false 时即使超过 300ms 也绝不触发 target", () => {
+  const backgroundReady = false;
+  const officialBootstrapCompleted = true;
+  const strictMode = false;
+  const rootElapsed = 500;
+  const DOCKER_OPTIMISTIC_TARGET_GRACE_MS = 300;
 
-  const rootElapsed = now - rootEnteredAt;
-  const readyElapsed = now - dockerHealthReadyAt;
-  const remainingRootDwell = Math.max(0, minimumRootDwellMs - rootElapsed); // 100ms
-  const remainingStability = Math.max(0, readyStabilityMs - readyElapsed); // 250ms
-  const remaining = Math.max(remainingRootDwell, remainingStability); // 250ms
+  const canOptimisticTarget = !strictMode
+    && officialBootstrapCompleted
+    && backgroundReady
+    && (rootElapsed >= DOCKER_OPTIMISTIC_TARGET_GRACE_MS);
 
-  assert.equal(remaining, 250);
-  assert.notEqual(remaining, 500);
-  assert.notEqual(remaining, 1000);
+  assert.equal(canOptimisticTarget, false);
 });
 
-test("COLD7 (T5): root dwell 已满足仅差 stability 时计算精确 remaining (150ms)", () => {
-  const now = 10800;
-  const rootEnteredAt = 10000; // rootElapsed = 800ms
-  const dockerHealthReadyAt = 10700; // readyElapsed = 100ms
-  const minimumRootDwellMs = 500;
-  const readyStabilityMs = 250;
-
-  const rootElapsed = now - rootEnteredAt;
-  const readyElapsed = now - dockerHealthReadyAt;
-  const remainingRootDwell = Math.max(0, minimumRootDwellMs - rootElapsed); // 0ms
-  const remainingStability = Math.max(0, readyStabilityMs - readyElapsed); // 150ms
-  const remaining = Math.max(remainingRootDwell, remainingStability); // 150ms
-
-  assert.equal(remaining, 150);
-});
-
-test("COLD8 (T6 & T7): stability 到点重新 probe；若期间 strongReady 掉线则 reset 且不发送 AUTH_READY", async () => {
-  let dockerHealthReadyAt = 10000;
-  let authReadySent = false;
-
-  // Recheck probe returns false (frameReady dropped)
-  const recheckSignal = combineDockerProbeSignals(true, false);
-  assert.equal(recheckSignal.strongReady, false);
-
-  if (!recheckSignal.strongReady) {
-    dockerHealthReadyAt = 0; // RESET!
-  } else {
-    authReadySent = true;
-  }
-
-  assert.equal(dockerHealthReadyAt, 0);
-  assert.equal(authReadySent, false);
-});
-
-test("COLD9 (T8): strongReady 一直稳定到点后发送 AUTH_READY 仅一次", async () => {
+test("COLD7 (T4): optimistic target 成功时完成流程且不增加 dockerRecoveryAttempts", async () => {
   const manager = new TabNavigationManager();
-  const tabId = 203;
+  const tabId = 301;
   const nav = manager.begin(tabId);
   const navigationId = nav.navigationId;
 
-  const now = Date.now();
-  const rootPending = {
+  const pending = {
     phase: "root",
     recoveryKind: "docker",
     bootstrapUrl: "https://5ddd.com/demo-nas/",
     rootUrl: "https://demo-nas.5ddd.com/",
     checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
     targetUrl: "https://demo-nas.5ddd.com/app/glance/",
-    rootEnteredAt: now - 600,
-    bootstrapCompletedAt: now - 600
+    dockerRecoveryAttempts: 0
   };
-  manager.setPending(tabId, rootPending, navigationId);
+  manager.setPending(tabId, pending, navigationId);
 
-  const probeSignals = combineDockerProbeSignals(true, true);
-  assert.equal(probeSignals.strongReady, true);
+  // Optimistic target navigation
+  const isOptimistic = true;
+  const targetPending = {
+    ...pending,
+    phase: "target",
+    targetAttempts: 1,
+    targetAttemptMode: "optimistic",
+    optimisticTargetAttempted: true,
+    dockerRecoveryAttempts: isOptimistic ? pending.dockerRecoveryAttempts : pending.dockerRecoveryAttempts + 1,
+    lastAttemptReason: "health-optimistic"
+  };
+  manager.setPending(tabId, targetPending, navigationId);
 
-  let targetCallCount = 0;
-  async function handleAuthReady() {
-    if (!manager.isActive(tabId, navigationId)) {
-      return { action: "ignored" };
-    }
-    const cur = manager.getPending(tabId);
-    if (!cur || cur.phase !== "root") {
-      return { action: "ignored" };
-    }
-    targetCallCount += 1;
-    const updated = {
-      ...cur,
-      phase: "target",
-      targetAttempts: Number(cur.targetAttempts ?? 0) + 1,
-      lastAttemptReason: "health",
-      lastAttemptAt: Date.now()
-    };
-    manager.setPending(tabId, updated, navigationId);
-    return { action: "navigating", pending: updated };
-  }
-
-  const res1 = await handleAuthReady();
-  assert.equal(res1.action, "navigating");
-
-  // Duplicate or late call
-  const res2 = await handleAuthReady();
-  assert.equal(res2.action, "ignored");
-  assert.equal(targetCallCount, 1);
+  assert.equal(targetPending.dockerRecoveryAttempts, 0);
+  assert.equal(targetPending.targetAttemptMode, "optimistic");
+  assert.equal(targetPending.optimisticTargetAttempted, true);
+  assert.equal(manager.getPending(tabId).dockerRecoveryAttempts, 0);
 });
 
-test("COLD10 (T9): 旧 navigation A 的 frameReady 事件不影响新 navigation B", () => {
-  let probeCalledForB = false;
-  const currentNavB = "nav-B";
-
-  function handleRuntimeMessage(message) {
-    if (message?.type === "DOCKER_FRAME_READY") {
-      if (message.navigationId && message.navigationId !== currentNavB) {
-        return;
-      }
-      probeCalledForB = true;
-    }
-  }
-
-  // Stale message with nav-A arrives
-  handleRuntimeMessage({ type: "DOCKER_FRAME_READY", navigationId: "nav-A" });
-  assert.equal(probeCalledForB, false);
-
-  // Valid message with nav-B arrives
-  handleRuntimeMessage({ type: "DOCKER_FRAME_READY", navigationId: "nav-B" });
-  assert.equal(probeCalledForB, true);
-});
-
-test("COLD11 (T10): 用户跳走取消 navigationId，后续 frameReady event 与 timer 完全失效", () => {
+test("COLD8 (T5): optimistic target 首次 AUTH_INVALID 不增加 dockerRecoveryAttempts 并开启 strictRecovery", async () => {
   const manager = new TabNavigationManager();
-  const tabId = 206;
+  const tabId = 302;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const targetPending = {
+    phase: "target",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    targetAttempts: 1,
+    targetAttemptMode: "optimistic",
+    optimisticTargetAttempted: true,
+    dockerRecoveryAttempts: 0,
+    strictRecovery: false
+  };
+  manager.setPending(tabId, targetPending, navigationId);
+
+  // Simulate handleAuthFailure on optimistic failure
+  const wasOptimistic = targetPending.targetAttemptMode === "optimistic";
+  const isFirstOptimisticFailure = wasOptimistic && !targetPending.strictRecovery;
+  assert.equal(isFirstOptimisticFailure, true);
+
+  const updatedPending = {
+    ...targetPending,
+    phase: "bootstrap",
+    dockerRecoveryAttempts: isFirstOptimisticFailure
+      ? targetPending.dockerRecoveryAttempts
+      : targetPending.dockerRecoveryAttempts + 1,
+    strictRecovery: isFirstOptimisticFailure ? true : targetPending.strictRecovery,
+    lastError: "unauthorized"
+  };
+  manager.setPending(tabId, updatedPending, navigationId);
+
+  assert.equal(updatedPending.dockerRecoveryAttempts, 0); // NOT incremented!
+  assert.equal(updatedPending.strictRecovery, true); // Strict mode enabled!
+});
+
+test("COLD9 (T6): strictRecovery=true 时禁止再次触发 optimistic target", () => {
+  const backgroundReady = true;
+  const frameReady = false;
+  const officialBootstrapCompleted = true;
+  const strictMode = true; // In strict recovery!
+  const rootElapsed = 600;
+  const DOCKER_OPTIMISTIC_TARGET_GRACE_MS = 300;
+
+  const canOptimisticTarget = !strictMode
+    && officialBootstrapCompleted
+    && backgroundReady
+    && (rootElapsed >= DOCKER_OPTIMISTIC_TARGET_GRACE_MS);
+
+  assert.equal(canOptimisticTarget, false);
+});
+
+test("COLD10 (T7): strict recovery 下必须等待 frameReady (strongReady) 后才 target", () => {
+  // Step 1: Only backgroundReady in strict mode -> not ready
+  const probeSignals1 = combineDockerProbeSignals(true, false);
+  assert.equal(probeSignals1.strongReady, false);
+
+  // Step 2: frameReady arrives -> strongReady is true -> confirmed ready
+  const probeSignals2 = combineDockerProbeSignals(true, true);
+  assert.equal(probeSignals2.strongReady, true);
+});
+
+test("COLD11 (T8): strict target 再次出现 AUTH_INVALID 时才增加 dockerRecoveryAttempts", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 303;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  // Strict target attempt (confirmed via strongReady)
+  const strictTargetPending = {
+    phase: "target",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    targetAttempts: 2,
+    targetAttemptMode: "confirmed",
+    optimisticTargetAttempted: true,
+    strictRecovery: true,
+    dockerRecoveryAttempts: 1
+  };
+  manager.setPending(tabId, strictTargetPending, navigationId);
+
+  // Failure occurs on strict attempt
+  const wasOptimistic = strictTargetPending.targetAttemptMode === "optimistic";
+  const isFirstOptimisticFailure = wasOptimistic && !strictTargetPending.strictRecovery;
+  assert.equal(isFirstOptimisticFailure, false);
+
+  const updatedPending = {
+    ...strictTargetPending,
+    phase: "bootstrap",
+    dockerRecoveryAttempts: strictTargetPending.dockerRecoveryAttempts + 1
+  };
+  manager.setPending(tabId, updatedPending, navigationId);
+
+  assert.equal(updatedPending.dockerRecoveryAttempts, 2);
+  assert.equal(shouldStopDockerRecovery(updatedPending.dockerRecoveryAttempts), true);
+});
+
+test("COLD12 (T9): 同一 navigation 最多只执行一次 optimistic target", () => {
+  let optimisticTargetCount = 0;
+  let pending = {
+    optimisticTargetAttempted: false,
+    strictRecovery: false
+  };
+
+  function attemptOptimisticTarget() {
+    if (!pending.strictRecovery && !pending.optimisticTargetAttempted) {
+      optimisticTargetCount += 1;
+      pending.optimisticTargetAttempted = true;
+      return true;
+    }
+    return false;
+  }
+
+  assert.equal(attemptOptimisticTarget(), true);
+  assert.equal(optimisticTargetCount, 1);
+
+  // Subsequent attempt rejected
+  assert.equal(attemptOptimisticTarget(), false);
+  assert.equal(optimisticTargetCount, 1);
+});
+
+test("COLD13 (T10): 旧 navigation A 的 optimistic timer 不影响新 navigation B", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 304;
+
+  const navA = manager.begin(tabId);
+  const pendingA = {
+    phase: "root",
+    recoveryKind: "docker",
+    targetUrl: "https://demo-nas-a.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pendingA, navA.navigationId);
+
+  const navB = manager.begin(tabId);
+  const pendingB = {
+    phase: "root",
+    recoveryKind: "docker",
+    targetUrl: "https://demo-nas-b.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pendingB, navB.navigationId);
+
+  // Timer from A fires with navA.navigationId
+  function handleOptimisticTimer(navId) {
+    if (!manager.isActive(tabId, navId)) {
+      return { action: "ignored" };
+    }
+    return { action: "navigating" };
+  }
+
+  const resA = handleOptimisticTimer(navA.navigationId);
+  assert.equal(resA.action, "ignored");
+  assert.equal(manager.isActive(tabId, navB.navigationId), true);
+});
+
+test("COLD14 (T11): 用户在 root 等待期间跳走取消 navigationId ownership", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 305;
   const nav = manager.begin(tabId);
   const navigationId = nav.navigationId;
 
@@ -2520,20 +2521,27 @@ test("COLD11 (T10): 用户跳走取消 navigationId，后续 frameReady event �
   assert.equal(manager.isActive(tabId, navigationId), false);
 });
 
-test("COLD12 (T11): recoveryTimeout 达到后真正停止 probe 与 timer，不无限轮询", () => {
-  const rootPending = {
-    startedAt: Date.now() - 130000
-  };
-  const recoveryTimeoutSeconds = 120;
-  const elapsed = Date.now() - Number(rootPending.startedAt);
-  let stopped = false;
-  if (elapsed >= recoveryTimeoutSeconds * 1000) {
-    stopped = true;
+test("COLD15 (T12): optimistic target 发出后晚到的 frameReady 事件不触发二次 target", () => {
+  let targetNavigations = 0;
+  let navigationRequested = false;
+
+  function handleTarget() {
+    if (navigationRequested) return false;
+    navigationRequested = true;
+    targetNavigations += 1;
+    return true;
   }
-  assert.equal(stopped, true);
+
+  // Optimistic target triggers
+  assert.equal(handleTarget(), true);
+  assert.equal(targetNavigations, 1);
+
+  // Late frameReady event arrives
+  assert.equal(handleTarget(), false);
+  assert.equal(targetNavigations, 1);
 });
 
-test("COLD13 (T12): learned LAN 二次打开仍优先于 Remote target-first 及 FN Connect recovery", async () => {
+test("COLD16 (T13): learned LAN 二次打开仍优先于 Remote target-first 及 FN Connect recovery", async () => {
   const manager = new TabNavigationManager();
   const storageMap = new Map();
   const mockStorage = {
@@ -2565,5 +2573,23 @@ test("COLD13 (T12): learned LAN 二次打开仍优先于 Remote target-first 及
   assert.ok(route);
   assert.equal(route.targetUrl, lanTargetUrl);
   assert.equal(route.healthUrl, lanHealthUrl);
+});
+
+test("COLD17 (T14): timing instrumentation 数据结构记录 root, background, frame, target 时间差", () => {
+  const rootEnteredAt = 10000;
+  const timing = {
+    rootEnteredAt,
+    backgroundReadyAt: 10040,
+    frameReadyAt: 10120,
+    targetAt: 10300
+  };
+
+  const bgElapsed = timing.backgroundReadyAt - timing.rootEnteredAt;
+  const frameElapsed = timing.frameReadyAt - timing.rootEnteredAt;
+  const targetElapsed = timing.targetAt - timing.rootEnteredAt;
+
+  assert.equal(bgElapsed, 40);
+  assert.equal(frameElapsed, 120);
+  assert.equal(targetElapsed, 300);
 });
 

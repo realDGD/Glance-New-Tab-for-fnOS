@@ -687,6 +687,7 @@ async function navigateToTarget(tabId, pending, reason, explicitNavigationId = n
   }
 
   const dockerRecovery = isDockerPending(pending);
+  const isOptimistic = reason === "health-optimistic" || reason.includes("optimistic");
   const postRecoveryAttempts = Number(pending.postRecoveryAttempts ?? 0);
   const dockerRecoveryAttempts = Number(
     pending.dockerRecoveryAttempts ?? pending.postRecoveryAttempts ?? 0
@@ -694,6 +695,7 @@ async function navigateToTarget(tabId, pending, reason, explicitNavigationId = n
   if (
     dockerRecovery
     && pending.phase !== "target"
+    && !isOptimistic
     && dockerRecoveryAttempts >= MAX_DOCKER_RECOVERY_ATTEMPTS
   ) {
     await setPending(tabId, {
@@ -708,12 +710,18 @@ async function navigateToTarget(tabId, pending, reason, explicitNavigationId = n
     ...pending,
     phase: "target",
     targetAttempts: Number(pending.targetAttempts ?? 0) + 1,
+    targetAttemptMode: isOptimistic ? "optimistic" : "confirmed",
+    optimisticTargetAttempted: isOptimistic ? true : Boolean(pending.optimisticTargetAttempted),
     postRecoveryAttempts: pending.phase === "target"
       ? postRecoveryAttempts
-      : postRecoveryAttempts + 1,
+      : isOptimistic
+        ? postRecoveryAttempts
+        : postRecoveryAttempts + 1,
     dockerRecoveryAttempts: pending.phase === "target"
       ? dockerRecoveryAttempts
-      : dockerRecoveryAttempts + 1,
+      : isOptimistic
+        ? dockerRecoveryAttempts
+        : dockerRecoveryAttempts + 1,
     dockerFrameReadyAt: null,
     lastAttemptReason: reason,
     lastAttemptAt: Date.now()
@@ -754,14 +762,18 @@ async function handleAuthFailure(tabId, reason = "authentication-failed", explic
 
   const attempts = Number(pending.targetAttempts ?? 0);
   const dockerRecovery = isDockerPending(pending);
+  const wasOptimistic = pending.targetAttemptMode === "optimistic"
+    || pending.lastAttemptReason === "health-optimistic";
+  const isFirstOptimisticFailure = dockerRecovery && wasOptimistic && !pending.strictRecovery;
+
   const dockerRecoveryAttempts = Number(
     pending.dockerRecoveryAttempts ?? pending.postRecoveryAttempts ?? 0
   );
   const manual = dockerRecovery
-    ? shouldStopDockerRecovery(dockerRecoveryAttempts)
+    ? (!isFirstOptimisticFailure && shouldStopDockerRecovery(dockerRecoveryAttempts))
     : attempts >= MAX_NATIVE_AUTOMATIC_ATTEMPTS;
   const backoffMs = dockerRecovery
-    ? (manual ? 0 : 1200)
+    ? (manual ? 0 : isFirstOptimisticFailure ? 300 : 1200)
     : Math.min(30000, Math.max(2500, 1500 * (2 ** attempts)));
   const now = Date.now();
   const bootstrapUrl = dockerRecovery
@@ -776,6 +788,8 @@ async function handleAuthFailure(tabId, reason = "authentication-failed", explic
     rootEnteredAt: manual || !dockerRecovery ? now : null,
     nextRetryAt: now + backoffMs,
     dockerFrameReadyAt: null,
+    strictRecovery: isFirstOptimisticFailure ? true : Boolean(pending.strictRecovery),
+    optimisticTargetAttempted: wasOptimistic ? true : Boolean(pending.optimisticTargetAttempted),
     lastError: reason
   };
   await setPending(tabId, updated, navigationId);
@@ -1415,10 +1429,17 @@ async function handleMessage(message, sender) {
       if (!pending || !canNavigateToRecoveryTarget(pending.phase) || !navContext?.navigationId) {
         return { action: "ignored" };
       }
+      const reason = message.via === "optimistic"
+        ? "health-optimistic"
+        : message.via === "confirmed"
+          ? "health-confirmed"
+          : message.via === "page"
+            ? "health"
+            : "health-background";
       return navigateToTarget(
         senderTabId,
         pending,
-        message.via === "page" ? "health" : "health-background",
+        reason,
         navContext.navigationId
       );
     });
