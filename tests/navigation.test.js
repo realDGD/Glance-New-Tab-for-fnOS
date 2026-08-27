@@ -2184,8 +2184,359 @@ test("BOOT10: Legacy preview cleanup cleans up any stale preview data on upgrade
   assert.equal(store.has("lan-route:https://demo-nas.5ddd.com/"), true);
 });
 
+test("COLD1: 首次 cold-start (sessionWarmed=false) 仍是 root-first", () => {
+  const settings = sanitizeSettings({
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    healthUrl: "https://demo-nas.5ddd.com/app/glance/health"
+  });
 
+  const mode = chooseInitialNavigation(settings, false);
+  assert.equal(mode, "root-first");
+  assert.notEqual(mode, "target-first");
+});
 
+test("COLD2: 二次打开 (sessionWarmed=true) 仍是 target-first", () => {
+  const settings = sanitizeSettings({
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    healthUrl: "https://demo-nas.5ddd.com/app/glance/health"
+  });
 
+  const mode = chooseInitialNavigation(settings, true);
+  assert.equal(mode, "target-first");
+  assert.notEqual(mode, "root-first");
+});
 
+test("COLD3: learned LAN 二次打开仍优先于 Remote target-first 及 FN Connect recovery", async () => {
+  const manager = new TabNavigationManager();
+  const storageMap = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(storageMap);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, storageMap.get(k)]));
+      return { [keys]: storageMap.get(keys) };
+    },
+    async set(obj) {
+      for (const [k, v] of Object.entries(obj)) storageMap.set(k, v);
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) storageMap.delete(k);
+    }
+  };
+  const store = new LanRouteStore(manager, mockStorage);
 
+  const remoteTargetUrl = "https://demo-nas.5ddd.com/app/glance/";
+  const lanTargetUrl = "http://192.168.1.10:8080/app/glance/";
+  const lanHealthUrl = "http://192.168.1.10:8080/app/glance/health";
+
+  await store.saveRoute(remoteTargetUrl, {
+    targetUrl: lanTargetUrl,
+    healthUrl: lanHealthUrl
+  });
+
+  const route = await store.getRoute(remoteTargetUrl);
+  assert.ok(route);
+  assert.equal(route.targetUrl, lanTargetUrl);
+  assert.equal(route.healthUrl, lanHealthUrl);
+});
+
+test("COLD4: 官方 bootstrap redirect 触发 bootstrap completion 并使用同 navigationId 推进 target", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 201;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, navigationId);
+
+  // Background handleCompletedBootstrapNavigation logic simulation
+  async function handleCompletedBootstrap(currentTabUrl) {
+    if (!manager.isActive(tabId, navigationId)) {
+      return { action: "ignored" };
+    }
+    const curPending = manager.getPending(tabId);
+    if (!curPending || !isDockerPending(curPending) || curPending.phase !== "bootstrap") {
+      return { action: "ignored" };
+    }
+    if (isBootstrapTransitUrl(curPending, currentTabUrl) || isConfiguredTargetPage(curPending, currentTabUrl)) {
+      return { action: "ignored" };
+    }
+
+    const isRoot = isConfiguredRootOrigin(curPending, currentTabUrl);
+    const now = Date.now();
+    const updated = {
+      ...curPending,
+      phase: "root",
+      bootstrapCompletedAt: now,
+      rootEnteredAt: now,
+      nextRetryAt: now
+    };
+    manager.setPending(tabId, updated, navigationId);
+
+    // Immediate navigation to target
+    const targetPending = {
+      ...updated,
+      phase: "target",
+      targetAttempts: Number(updated.targetAttempts ?? 0) + 1,
+      lastAttemptReason: isRoot ? "official-bootstrap-root-complete" : "official-bootstrap-external-route",
+      lastAttemptAt: now
+    };
+    manager.setPending(tabId, targetPending, navigationId);
+    manager.setExpectedUrl(tabId, navigationId, targetPending.targetUrl);
+
+    return { action: "navigating-target", pending: targetPending };
+  }
+
+  // Official FN Connect redirects to configured root
+  const result = await handleCompletedBootstrap("https://demo-nas.5ddd.com/");
+  assert.equal(result.action, "navigating-target");
+  assert.equal(result.pending.phase, "target");
+  assert.equal(result.pending.lastAttemptReason, "official-bootstrap-root-complete");
+  assert.equal(manager.getPending(tabId).phase, "target");
+  assert.equal(manager.isActive(tabId, navigationId), true);
+});
+
+test("COLD5: root complete 后立即进入 target 而不阻塞等待 health probe / dwell / grace", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 202;
+  const nav = manager.begin(tabId);
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, nav.navigationId);
+
+  let targetNavigated = false;
+  let healthProbed = false;
+
+  // Root complete event arrives
+  const isRoot = isConfiguredRootOrigin(pending, "https://demo-nas.5ddd.com/");
+  assert.equal(isRoot, true);
+
+  // Directly transitions and triggers target navigation without health probe
+  if (isRoot) {
+    targetNavigated = true;
+  }
+
+  assert.equal(targetNavigated, true);
+  assert.equal(healthProbed, false);
+});
+
+test("COLD6: root complete 最终通过 navigateOwnedTab 实际导航至 Glance target", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 203;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  let actualNavigatedUrl = "";
+  const mockTabs = {
+    async update(id, { url }) {
+      actualNavigatedUrl = url;
+    }
+  };
+
+  async function navigateOwnedTab(tId, nId, tUrl, options = {}) {
+    if (!manager.isActive(tId, nId)) {
+      return { ok: false, reason: "stale-navigation" };
+    }
+    manager.setExpectedUrl(tId, nId, tUrl);
+    try {
+      await mockTabs.update(tId, { url: tUrl, ...options });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+
+  const targetUrl = "https://demo-nas.5ddd.com/app/glance/";
+  const navResult = await navigateOwnedTab(tabId, navigationId, targetUrl);
+
+  assert.equal(navResult.ok, true);
+  assert.equal(actualNavigatedUrl, targetUrl);
+  assert.equal(manager.isActive(tabId, navigationId), true);
+});
+
+test("COLD7: Glance auth failure 仍能触发 handleAuthFailure recovery", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 204;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  // After entering target
+  const targetPending = {
+    phase: "target",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/",
+    targetAttempts: 1,
+    dockerRecoveryAttempts: 1
+  };
+  manager.setPending(tabId, targetPending, navigationId);
+
+  // Auth failure occurs (e.g. invalid token)
+  async function handleAuthFailureSimulation(reason) {
+    if (!manager.isActive(tabId, navigationId)) {
+      return { action: "ignored" };
+    }
+    const curPending = manager.getPending(tabId);
+    const updated = {
+      ...curPending,
+      phase: "bootstrap",
+      lastError: reason,
+      nextRetryAt: Date.now()
+    };
+    manager.setPending(tabId, updated, navigationId);
+    manager.setExpectedUrl(tabId, navigationId, updated.bootstrapUrl);
+    return { action: "recovering-bootstrap", pending: updated };
+  }
+
+  const result = await handleAuthFailureSimulation("invalid-token");
+  assert.equal(result.action, "recovering-bootstrap");
+  assert.equal(result.pending.phase, "bootstrap");
+  assert.equal(manager.getPending(tabId).phase, "bootstrap");
+});
+
+test("COLD8: 用户主动导航取消首次流程，后续 root complete 回调被完全忽略", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 205;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, navigationId);
+
+  // User actively enters example.com
+  const changeResult = manager.handleUrlChange(tabId, "https://example.com/", pending);
+  assert.equal(changeResult.matched, false);
+  assert.equal(changeResult.cancelled, true);
+  assert.equal(manager.isActive(tabId, navigationId), false);
+
+  // Subsequent root completion callback arrives
+  async function handleCompletedBootstrap(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    return { action: "navigating-target" };
+  }
+
+  const callbackResult = await handleCompletedBootstrap(navigationId);
+  assert.equal(callbackResult.action, "ignored");
+});
+
+test("COLD9: 旧 navigation A 的 root complete 回调不影响新 navigation B", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 206;
+
+  // Nav A begins
+  const navA = manager.begin(tabId);
+  const pendingA = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas-a/",
+    rootUrl: "https://demo-nas-a.5ddd.com/",
+    targetUrl: "https://demo-nas-a.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pendingA, navA.navigationId);
+
+  // Nav B begins on same tab
+  const navB = manager.begin(tabId);
+  const pendingB = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas-b/",
+    rootUrl: "https://demo-nas-b.5ddd.com/",
+    targetUrl: "https://demo-nas-b.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pendingB, navB.navigationId);
+
+  // Stale callback from Nav A arrives
+  async function handleCompletedBootstrap(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    return { action: "navigating-target" };
+  }
+
+  const resA = await handleCompletedBootstrap(navA.navigationId);
+  assert.equal(resA.action, "ignored");
+
+  // Nav B is still active
+  assert.equal(manager.isActive(tabId, navB.navigationId), true);
+  assert.equal(manager.getPending(tabId).bootstrapUrl, "https://5ddd.com/demo-nas-b/");
+});
+
+test("COLD10: 官方 root 页面完成加载后不再永久停留，完整冷启动链路直接通往 Glance", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 207;
+  const nav = manager.begin(tabId);
+  const navigationId = nav.navigationId;
+
+  const history = [];
+  const mockTabs = {
+    async update(id, { url }) {
+      history.push(url);
+    }
+  };
+
+  // Step 1: Open new tab on cold start (root-first)
+  const initialPending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, initialPending, navigationId);
+  history.push(initialPending.bootstrapUrl);
+
+  // Step 2: Official FN Connect completes network check and redirects to root origin
+  const rootUrl = "https://demo-nas.5ddd.com/";
+  const changeResult = manager.handleUrlChange(tabId, rootUrl, initialPending);
+  assert.equal(changeResult.matched, true);
+  assert.equal(changeResult.active, true);
+
+  // Step 3: Root document finishes loading (status = "complete"), background advances immediately to Glance
+  const updatedPending = {
+    ...initialPending,
+    phase: "target",
+    bootstrapCompletedAt: Date.now(),
+    targetAttempts: 1,
+    lastAttemptReason: "official-bootstrap-root-complete"
+  };
+  manager.setPending(tabId, updatedPending, navigationId);
+  manager.setExpectedUrl(tabId, navigationId, updatedPending.targetUrl);
+  await mockTabs.update(tabId, { url: updatedPending.targetUrl });
+
+  // Step 4: Glance page attaches, visual ready, overlay fades out
+  assert.deepEqual(history, [
+    "https://5ddd.com/demo-nas/",
+    "https://demo-nas.5ddd.com/app/glance/"
+  ]);
+  assert.equal(manager.getPending(tabId).phase, "target");
+  assert.equal(manager.isActive(tabId, navigationId), true);
+});

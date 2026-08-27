@@ -746,6 +746,10 @@
       }
 
       const completion = await send({ type: "BOOTSTRAP_COMPLETE" });
+      if (completion?.action === "navigating") {
+        stopped = true;
+        return;
+      }
       if (completion?.pending) {
         pending = completion.pending;
       }
