@@ -1459,6 +1459,10 @@ async function handleMessage(message, sender) {
           ...pending,
           dockerFrameReadyAt: Date.now()
         }, navContext.navigationId);
+        chrome.tabs.sendMessage(senderTabId, {
+          type: "DOCKER_FRAME_READY",
+          navigationId: navContext.navigationId
+        }, { frameId: 0 }).catch(() => null);
         return { action: "ready" };
       }
       if (pending.dockerFrameReadyAt) {

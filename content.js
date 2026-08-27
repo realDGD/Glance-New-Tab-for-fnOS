@@ -769,8 +769,39 @@
     let dockerFallbackRequested = false;
     let dockerHealthReadyAt = 0;
     let probeRound = 0;
+    let probeInFlight = false;
+    let probeAgainRequested = false;
+    let nextProbeTimer = null;
+
+    function handleRuntimeMessage(message) {
+      if (stopped) {
+        return;
+      }
+      if (message?.type === "DOCKER_FRAME_READY") {
+        if (message.navigationId && message.navigationId !== navigationId) {
+          return;
+        }
+        void probeNow();
+      }
+    }
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+
+    function cleanupProbeResources() {
+      chrome.runtime.onMessage.removeListener(handleRuntimeMessage);
+      if (nextProbeTimer) {
+        window.clearTimeout(nextProbeTimer);
+        nextProbeTimer = null;
+      }
+      if (fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      dockerProbeFrame?.remove();
+    }
 
     function showManualLogin(message, showRetry = false) {
+      stopped = true;
+      cleanupProbeResources();
       removeLoadingOverlay();
       setBadge(message, showRetry);
     }
@@ -798,6 +829,7 @@
       const response = await send({ type: "TRY_TARGET" });
       if (response?.action === "navigating") {
         stopped = true;
+        cleanupProbeResources();
         return;
       }
 
@@ -861,16 +893,24 @@
           }
           const rootElapsed = now - Number(pending.rootEnteredAt ?? now);
           const readyElapsed = now - dockerHealthReadyAt;
-          if (
-            rootElapsed < minimumRootDwellMs
-            || readyElapsed < readyStabilityMs
-          ) {
+          const remainingRootDwell = Math.max(0, minimumRootDwellMs - rootElapsed);
+          const remainingStability = Math.max(0, readyStabilityMs - readyElapsed);
+          const remaining = Math.max(remainingRootDwell, remainingStability);
+
+          if (remaining > 0) {
             setLoading(
               officialBootstrapCompleted
                 ? "FN Connect 官方检测与 Docker 检测均已通过，正在打开 Glance…"
                 : "FN Connect 双重检测已通过，正在快速打开 Docker Glance…",
               settings
             );
+            if (nextProbeTimer) {
+              window.clearTimeout(nextProbeTimer);
+            }
+            nextProbeTimer = window.setTimeout(() => {
+              nextProbeTimer = null;
+              void probeNow();
+            }, remaining);
             return;
           }
         }
@@ -885,7 +925,7 @@
         });
         if (response?.action === "navigating") {
           stopped = true;
-          dockerProbeFrame?.remove();
+          cleanupProbeResources();
         } else {
           navigationRequested = false;
         }
@@ -919,11 +959,6 @@
       }
 
       if (elapsed >= Number(settings.recoveryTimeoutSeconds) * 1000) {
-        stopped = true;
-        if (fallbackTimer) {
-          window.clearTimeout(fallbackTimer);
-        }
-        dockerProbeFrame?.remove();
         showManualLogin(
           dockerRecovery
             ? "fnOS 会话已恢复，但 Docker 服务授权长时间未就绪；请重新检测。"
@@ -939,22 +974,43 @@
           await tryTargetAfterGrace();
         }
       }
-    }
 
-    await tick();
-    async function scheduleNextProbe() {
-      if (stopped) {
-        window.clearTimeout(fallbackTimer);
-        return;
+      if (nextProbeTimer) {
+        window.clearTimeout(nextProbeTimer);
       }
       const delay = PROBE_DELAYS_MS[Math.min(probeRound, PROBE_DELAYS_MS.length - 1)];
       probeRound += 1;
-      window.setTimeout(async () => {
-        await tick();
-        await scheduleNextProbe();
+      nextProbeTimer = window.setTimeout(() => {
+        nextProbeTimer = null;
+        void probeNow();
       }, delay);
     }
-    await scheduleNextProbe();
+
+    async function probeNow() {
+      if (stopped) {
+        return;
+      }
+      if (probeInFlight) {
+        probeAgainRequested = true;
+        return;
+      }
+      if (nextProbeTimer) {
+        window.clearTimeout(nextProbeTimer);
+        nextProbeTimer = null;
+      }
+      probeInFlight = true;
+      probeAgainRequested = false;
+      try {
+        await tick();
+      } finally {
+        probeInFlight = false;
+      }
+      if (!stopped && probeAgainRequested) {
+        void probeNow();
+      }
+    }
+
+    void probeNow();
   }
 
   async function startKeepAlive(settings) {
