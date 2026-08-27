@@ -4,7 +4,6 @@ import {
   chooseInitialNavigation,
   combineDockerProbeSignals,
   DEFAULT_SETTINGS,
-  FnConnectWarmupManager,
   hostPermissionPattern,
   inferLanHealthUrl,
   inferLanNativeTargetUrl,
@@ -22,7 +21,6 @@ import {
   LanRouteStore,
   LanScriptManager,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
-  MAX_NEWTAB_WARMUP_WAIT_MS,
   NavigationPersistence,
   normalizeNavigableUrl,
   OwnedTabController,
@@ -30,8 +28,7 @@ import {
   sanitizeSettings,
   shouldStopDockerRecovery,
   TabNavigationManager,
-  validateRecoverySettings,
-  WARMUP_STATE_STORAGE_KEY
+  validateRecoverySettings
 } from "./shared.js";
 
 const PENDING_PREFIX = "pending-recovery:";
@@ -95,16 +92,9 @@ const navPersistence = new NavigationPersistence();
 const lanRouteStore = new LanRouteStore(tabNavigations);
 const ownedTabController = new OwnedTabController(tabNavigations, navPersistence);
 const lanScriptManager = new LanScriptManager();
-const warmupManager = new FnConnectWarmupManager({
-  markWarmedFn: markSessionWarmed
-});
 
 void restoreLanContentScripts().catch((error) => {
   console.error("Failed to restore LAN content scripts on startup:", error);
-});
-
-void warmupManager.rehydrate((url) => probeAuth(url)).catch((error) => {
-  console.error("Failed to rehydrate warmup manager:", error);
 });
 
 function routeKey(targetUrl) {
@@ -685,53 +675,13 @@ async function openConfiguredPage(tabId, source = "new-tab", explicitNavigationI
     return { action: "checking-target", themeMode: settings.themeMode };
   }
 
-  // 3. If warmup is in-flight in background, dispatch continuation and return waiting-warmup immediately!
-  if (warmupManager.isWarming()) {
-    console.debug?.(`[FNOS prewarm] New Tab (tab ${tabId}, nav ${navigationId}) waiting for in-flight warmup`);
-    void continueAfterWarmup({ tabId, navigationId, settings, source });
-    return { action: "waiting-warmup", themeMode: settings.themeMode, settings };
-  }
-
+  // 3. First time in this browser session -> root-first recovery on this New Tab
   if (!tabNavigations.isActive(tabId, navigationId)) {
     return { action: "cancelled", themeMode: settings.themeMode };
   }
 
   await beginRecovery(tabId, settings, `${source}-cold-start`, navigationId);
   return { action: "recovering-startup", themeMode: settings.themeMode };
-}
-
-async function continueAfterWarmup({ tabId, navigationId, settings, source }) {
-  try {
-    const warmupResult = await warmupManager.waitForWarmup(
-      tabId,
-      navigationId,
-      settings,
-      MAX_NEWTAB_WARMUP_WAIT_MS
-    );
-
-    if (!tabNavigations.isActive(tabId, navigationId)) {
-      return;
-    }
-
-    if (warmupResult.warmed) {
-      console.debug?.(`[FNOS prewarm] Warmup ready, navigating tab ${tabId} (nav ${navigationId}) target-first`);
-      await beginTargetFirst(tabId, settings, `${source}-warmup-ready`, navigationId);
-      return;
-    }
-
-    console.debug?.(
-      `[FNOS prewarm] In-flight warmup timed out/failed (${warmupResult.reason}), taking over foreground recovery on tab ${tabId}`
-    );
-    await warmupManager.cancelWarmup("takeover-timeout");
-
-    if (!tabNavigations.isActive(tabId, navigationId)) {
-      return;
-    }
-
-    await beginRecovery(tabId, settings, `${source}-warmup-failed-takeover`, navigationId);
-  } catch (error) {
-    console.error(`[FNOS prewarm] Error in continueAfterWarmup for tab ${tabId}:`, error);
-  }
 }
 
 async function navigateToTarget(tabId, pending, reason, explicitNavigationId = null) {
@@ -1403,16 +1353,6 @@ async function handleMessage(message, sender) {
   }
 
   if (type === "CONTENT_HELLO") {
-    if (warmupManager.isHelperTab(senderTabId)) {
-      const settings = await loadSettings();
-      return {
-        isWarmupHelper: true,
-        warmupId: warmupManager.warmupId,
-        pending: warmupManager.getPendingForHelper(),
-        settings,
-        deviceRoute: null
-      };
-    }
     const navContext = await ensureNavigationContext(senderTabId);
     const settings = await loadSettings();
     return {
@@ -1519,22 +1459,6 @@ async function handleMessage(message, sender) {
   }
 
   if (type === "PROBE_AUTH") {
-    if (warmupManager.isHelperTab(senderTabId)) {
-      const helperPending = warmupManager.getPendingForHelper();
-      const checkUrl = helperPending?.checkUrl;
-      const frameReady = Boolean(
-        warmupManager.dockerFrameReadyAt
-        && Date.now() - warmupManager.dockerFrameReadyAt <= DOCKER_FRAME_READY_TTL_MS
-      );
-      const backgroundResult = await probeAuth(checkUrl);
-      const signals = combineDockerProbeSignals(backgroundResult.ok, frameReady);
-      return {
-        ...backgroundResult,
-        ...signals,
-        via: signals.strongReady ? "dual" : signals.frameReady ? "frame" : "background"
-      };
-    }
-
     const navContext = await ensureNavigationContext(senderTabId);
     const pending = navContext?.pending;
     const frameReady = Boolean(
@@ -1591,11 +1515,6 @@ async function handleMessage(message, sender) {
   }
 
   if (type === "DOCKER_FRAME_PROBE_RESULT") {
-    if (warmupManager.isHelperTab(senderTabId)) {
-      warmupManager.handleFrameProbeResult(senderTabId, message.result);
-      return { action: message.result === "ready" ? "ready" : "waiting" };
-    }
-
     return serializeTabTransition(senderTabId, async () => {
       const navContext = await ensureNavigationContext(senderTabId);
       const pending = navContext?.pending;
@@ -1753,19 +1672,6 @@ async function handleRuntimeStartup() {
   } catch (error) {
     console.error("Failed to restore LAN content scripts on startup:", error);
   }
-  try {
-    const settings = await loadSettings();
-    if (
-      settings.setupCompleted
-      && settings.enabled
-      && settings.fnosRecoveryEnabled
-      && isFnOsUrl(settings.targetUrl)
-    ) {
-      await warmupManager.startWarmup(settings, "startup", (url) => probeAuth(url));
-    }
-  } catch (error) {
-    console.error("Failed to start FN Connect warmup on startup:", error);
-  }
 }
 
 chrome.runtime.onStartup.addListener(() => {
@@ -1779,32 +1685,21 @@ chrome.action.onClicked.addListener(() => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (warmupManager.isHelperTab(tabId)) {
-    warmupManager.handleTabRemoved(tabId);
-  } else {
-    void cancelNavigation(tabId, "tab-removed");
-    void navPersistence.removeAllForTab(tabId);
-  }
+  void cancelNavigation(tabId, "tab-removed");
+  void navPersistence.removeAllForTab(tabId);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (typeof changeInfo.url === "string") {
-    if (warmupManager.isHelperTab(tabId)) {
-      void warmupManager.handleTabUrlCommit(tabId, changeInfo.url);
+    const result = tabNavigations.handleUrlChange(tabId, changeInfo.url);
+    if (result.cancelled) {
+      void cancelNavigation(tabId, "url-mismatch", result.navigationId || result.generation);
     } else {
-      const result = tabNavigations.handleUrlChange(tabId, changeInfo.url);
-      if (result.cancelled) {
-        void cancelNavigation(tabId, "url-mismatch", result.navigationId || result.generation);
-      } else {
-        void handleBootstrapUrlCommit(tabId, changeInfo.url);
-      }
+      void handleBootstrapUrlCommit(tabId, changeInfo.url);
     }
   }
 
   if (changeInfo.status === "complete" && typeof tab.url === "string") {
-    if (warmupManager.isHelperTab(tabId)) {
-      return;
-    }
     void (async () => {
       if (await handleLanDiscoveryCandidate(tabId, tab.url)) {
         return;
