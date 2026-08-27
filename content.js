@@ -393,7 +393,19 @@
       const columnElements = rootDocument.querySelectorAll(".column, [class*='column'], .grid-col");
       const columns = [];
 
+      const isExtensionOverlay = (el) => {
+        try {
+          return el && (el.id === "keep-fnnas-login-loading"
+            || (typeof el.closest === "function" && Boolean(el.closest("#keep-fnnas-login-loading"))));
+        } catch {
+          return false;
+        }
+      };
+
       const processWidget = (widgetEl) => {
+        if (isExtensionOverlay(widgetEl)) {
+          return null;
+        }
         if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i], input[name*="auth" i], input[type="hidden"], textarea, form')) {
           return null;
         }
@@ -424,6 +436,9 @@
 
       if (columnElements.length > 0) {
         for (const colEl of Array.from(columnElements).slice(0, 4)) {
+          if (isExtensionOverlay(colEl)) {
+            continue;
+          }
           const widgetEls = colEl.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
           const widgets = [];
           for (const w of Array.from(widgetEls).slice(0, 8)) {
@@ -477,6 +492,19 @@
       return false;
     } catch {
       return false;
+    }
+  }
+
+  function schedulePreviewRefresh(targetUrl = location.href) {
+    const run = () => {
+      void saveCurrentGlancePreview(targetUrl);
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(run, { timeout: 1000 });
+    } else {
+      queueMicrotask(() => {
+        window.requestAnimationFrame(run);
+      });
     }
   }
 
@@ -1078,7 +1106,7 @@
       stopped = true;
       await send({ type: "TARGET_READY" });
 
-      void saveCurrentGlancePreview(pending.targetUrl);
+      schedulePreviewRefresh(pending.targetUrl);
 
       await startKeepAlive(
         pending.recoveryKind === "native-lan"
@@ -1382,7 +1410,9 @@
 
     if (!directFailure) {
       await waitForVisualReady();
-      void saveCurrentGlancePreview(location.href);
+      if (isConfiguredTarget) {
+        schedulePreviewRefresh(location.href);
+      }
       await new Promise((resolve) => window.requestAnimationFrame(() => {
         window.requestAnimationFrame(resolve);
       }));

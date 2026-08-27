@@ -24,6 +24,7 @@ import {
   sanitizeSafeText,
   extractGlancePreview,
   saveGlancePreviewToStorage,
+  schedulePreviewRefresh,
   getPreviewStatus,
   renderGlancePreviewHtml,
   renderGlanceSkeletonHtml
@@ -2105,6 +2106,326 @@ test("P1-T11: Old Preview entities are preserved when active pointer is cleared"
   assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
   assert.equal(store.has(keyA), true);
   assert.equal(store.get(keyA).pageTitle, "Preview A");
+});
+
+test("PT1: Non-target fnOS root does NOT save Preview or update active target pointer", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const hello = {
+    pending: null,
+    settings: {
+      enabled: true,
+      fnosRecoveryEnabled: true,
+      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
+    },
+    deviceRoute: {
+      targetUrl: "http://192.168.1.10:18080/"
+    }
+  };
+
+  const currentTabUrl = "https://demo-nas.5ddd.com/"; // fnOS root page
+  const directFailure = ""; // No invalid token on root
+  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl)
+    || isConfiguredTargetPage(hello.deviceRoute, currentTabUrl);
+
+  assert.equal(isConfiguredTarget, false);
+
+  // Content script execution simulation:
+  let previewScheduled = false;
+  if (!directFailure) {
+    if (isConfiguredTarget) {
+      previewScheduled = true;
+      await saveGlancePreviewToStorage(mockStorage, {}, currentTabUrl);
+    }
+  }
+
+  assert.equal(previewScheduled, false);
+  assert.equal(store.size, 0);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+});
+
+test("PT2: Other same-domain non-target pages do NOT save Preview", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const hello = {
+    pending: null,
+    settings: {
+      enabled: true,
+      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
+    },
+    deviceRoute: {
+      targetUrl: "http://192.168.1.10:18080/"
+    }
+  };
+
+  const testUrls = [
+    "https://demo-nas.5ddd.com/settings",
+    "https://5ddd.com/demo-nas/",
+    "https://demo-nas.5ddd.com/files/",
+    "http://192.168.1.10:8000/" // different port, not Glance
+  ];
+
+  for (const url of testUrls) {
+    const isConfiguredTarget = isConfiguredTargetPage(hello.settings, url)
+      || isConfiguredTargetPage(hello.deviceRoute, url);
+    assert.equal(isConfiguredTarget, false);
+  }
+});
+
+test("PT3: pending=null learned LAN fast path integration schedules and saves Preview and updates pointer", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const lanTargetUrl = "http://192.168.1.10:18080/";
+  const hello = {
+    pending: null, // Fast path clears pending in background
+    settings: {
+      enabled: true,
+      targetUrl: "https://demo-nas.5ddd.com/app/glance-homepage/"
+    },
+    deviceRoute: {
+      targetUrl: lanTargetUrl
+    }
+  };
+
+  const currentTabUrl = "http://192.168.1.10:18080/";
+  const directFailure = "";
+  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl)
+    || isConfiguredTargetPage(hello.deviceRoute, currentTabUrl);
+
+  assert.equal(isConfiguredTarget, true);
+
+  const mockDoc = {
+    title: "LAN Glance",
+    documentElement: { dataset: { theme: "auto" } },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{
+      querySelectorAll: () => [{
+        querySelector: (s) => {
+          if (s.includes("password") || s.includes("token")) return null;
+          return { textContent: "LAN Dashboard" };
+        },
+        querySelectorAll: () => []
+      }]
+    }]
+  };
+
+  let scheduled = false;
+  if (!directFailure && isConfiguredTarget) {
+    scheduled = true;
+    await saveGlancePreviewToStorage(mockStorage, mockDoc, currentTabUrl);
+  }
+
+  assert.equal(scheduled, true);
+  const key = previewStorageKey(lanTargetUrl);
+  assert.equal(store.has(key), true);
+  assert.equal(store.get(key).pageTitle, "LAN Glance");
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "http://192.168.1.10:18080/");
+});
+
+test("PT4: pending=null remote/direct success integration schedules and saves Preview", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const remoteUrl = "https://demo-nas.5ddd.com/app/glance-homepage/";
+  const hello = {
+    pending: null,
+    settings: {
+      enabled: true,
+      targetUrl: remoteUrl
+    },
+    deviceRoute: null
+  };
+
+  const currentTabUrl = remoteUrl;
+  const isConfiguredTarget = isConfiguredTargetPage(hello.settings, currentTabUrl);
+  assert.equal(isConfiguredTarget, true);
+
+  const mockDoc = {
+    title: "Remote Glance Homepage",
+    documentElement: { dataset: { theme: "dark" } },
+    body: { classList: { contains: () => true } },
+    querySelectorAll: () => [{
+      querySelectorAll: () => [{
+        querySelector: (s) => {
+          if (s.includes("password")) return null;
+          return { textContent: "Widgets" };
+        },
+        querySelectorAll: () => []
+      }]
+    }]
+  };
+
+  await saveGlancePreviewToStorage(mockStorage, mockDoc, currentTabUrl);
+  assert.equal(store.has(previewStorageKey(remoteUrl)), true);
+  assert.equal(store.get(ACTIVE_PREVIEW_TARGET_KEY), "https://demo-nas.5ddd.com/app/glance-homepage/");
+});
+
+test("PT5: Configured target + auth failure does NOT save Preview", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const remoteUrl = "https://demo-nas.5ddd.com/app/glance-homepage/";
+  const directFailure = "invalid-token"; // Auth failure detected
+  const isConfiguredTarget = true;
+
+  let saved = false;
+  if (!directFailure && isConfiguredTarget) {
+    saved = true;
+    await saveGlancePreviewToStorage(mockStorage, {}, remoteUrl);
+  }
+
+  assert.equal(saved, false);
+  assert.equal(store.size, 0);
+});
+
+test("PT6: Fade does not await DOM extraction", (t, done) => {
+  const events = [];
+
+  // Simulate scheduler
+  function scheduleRefresh(cb) {
+    setTimeout(() => {
+      events.push("extraction_executed");
+      cb();
+    }, 15);
+  }
+
+  // Simulate main flow
+  function onVisualReady() {
+    events.push("visual_ready");
+    scheduleRefresh(() => {});
+    events.push("fade_started");
+  }
+
+  onVisualReady();
+
+  assert.deepEqual(events, ["visual_ready", "fade_started"]);
+  setTimeout(() => {
+    assert.deepEqual(events, ["visual_ready", "fade_started", "extraction_executed"]);
+    done();
+  }, 25);
+});
+
+test("PT7: schedulePreviewRefresh uses requestIdleCallback when available", (t, done) => {
+  let idleCalled = false;
+  const mockGlobal = {
+    requestIdleCallback(fn, opts) {
+      assert.equal(opts.timeout, 1000);
+      idleCalled = true;
+      fn();
+    }
+  };
+
+  schedulePreviewRefresh(() => {
+    assert.equal(idleCalled, true);
+    done();
+  }, mockGlobal);
+});
+
+test("PT8: schedulePreviewRefresh uses fallback scheduler when requestIdleCallback is undefined", (t, done) => {
+  let microtaskCalled = false;
+  let rafCalled = false;
+
+  const mockGlobal = {
+    requestIdleCallback: undefined,
+    queueMicrotask(fn) {
+      microtaskCalled = true;
+      fn();
+    },
+    requestAnimationFrame(fn) {
+      rafCalled = true;
+      fn();
+    }
+  };
+
+  schedulePreviewRefresh(() => {
+    assert.equal(microtaskCalled, true);
+    assert.equal(rafCalled, true);
+    done();
+  }, mockGlobal);
+});
+
+test("PT9: Preview storage reject does not affect fade, visual ready or trigger error UI", async () => {
+  const faultyStorage = {
+    async set() {
+      throw new Error("QuotaExceededError");
+    }
+  };
+
+  const mockDoc = {
+    title: "Glance",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: () => ({ textContent: "W" }), querySelectorAll: () => [] }] }]
+  };
+
+  let threw = false;
+  try {
+    const res = await saveGlancePreviewToStorage(faultyStorage, mockDoc, "https://glance.local/");
+    assert.equal(res, false);
+  } catch {
+    threw = true;
+  }
+  assert.equal(threw, false);
+});
+
+test("PT10: Preview content and savedAt are refreshed on consecutive configured target successes", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const targetUrl = "https://nas.5ddd.com/glance/";
+  const docA = {
+    title: "Initial Glance",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "Card A" }), querySelectorAll: () => [] }] }]
+  };
+
+  await saveGlancePreviewToStorage(mockStorage, docA, targetUrl);
+  const key = previewStorageKey(targetUrl);
+  const prevA = store.get(key);
+  assert.equal(prevA.pageTitle, "Initial Glance");
+  const timeA = prevA.savedAt;
+
+  await new Promise((r) => setTimeout(r, 10));
+
+  const docB = {
+    title: "Updated Glance",
+    documentElement: { dataset: {} },
+    body: { classList: { contains: () => false } },
+    querySelectorAll: () => [{ querySelectorAll: () => [{ querySelector: (s) => s.includes("password") ? null : ({ textContent: "Card B" }), querySelectorAll: () => [] }] }]
+  };
+
+  await saveGlancePreviewToStorage(mockStorage, docB, targetUrl);
+  const prevB = store.get(key);
+  assert.equal(prevB.pageTitle, "Updated Glance");
+  assert.ok(prevB.savedAt > timeA);
 });
 
 

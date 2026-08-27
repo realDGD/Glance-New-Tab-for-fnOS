@@ -1471,7 +1471,19 @@ export function extractGlancePreview(rootDocument, targetUrl) {
     const columnElements = rootDocument.querySelectorAll(".column, [class*='column'], .grid-col");
     const columns = [];
 
+    const isExtensionOverlay = (el) => {
+      try {
+        return el && (el.id === "keep-fnnas-login-loading"
+          || (typeof el.closest === "function" && Boolean(el.closest("#keep-fnnas-login-loading"))));
+      } catch {
+        return false;
+      }
+    };
+
     const processWidget = (widgetEl) => {
+      if (isExtensionOverlay(widgetEl)) {
+        return null;
+      }
       if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i], input[name*="auth" i], input[type="hidden"], textarea, form')) {
         return null;
       }
@@ -1502,6 +1514,9 @@ export function extractGlancePreview(rootDocument, targetUrl) {
 
     if (columnElements.length > 0) {
       for (const colEl of Array.from(columnElements).slice(0, 4)) {
+        if (isExtensionOverlay(colEl)) {
+          continue;
+        }
         const widgetEls = colEl.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
         const widgets = [];
         for (const w of Array.from(widgetEls).slice(0, 8)) {
@@ -1535,6 +1550,34 @@ export function extractGlancePreview(rootDocument, targetUrl) {
   } catch {
     return null;
   }
+}
+
+export function schedulePreviewRefresh(callback, globalScope = globalThis) {
+  if (typeof globalScope?.requestIdleCallback === "function") {
+    return globalScope.requestIdleCallback(() => {
+      void callback();
+    }, { timeout: 1000 });
+  }
+  if (typeof globalScope?.queueMicrotask === "function") {
+    globalScope.queueMicrotask(() => {
+      if (typeof globalScope?.requestAnimationFrame === "function") {
+        globalScope.requestAnimationFrame(() => {
+          void callback();
+        });
+      } else {
+        void callback();
+      }
+    });
+    return null;
+  }
+  if (typeof globalScope?.requestAnimationFrame === "function") {
+    return globalScope.requestAnimationFrame(() => {
+      void callback();
+    });
+  }
+  return globalScope?.setTimeout?.(() => {
+    void callback();
+  }, 0);
 }
 
 export async function saveGlancePreviewToStorage(storageArea, rootDocument, targetUrl) {
