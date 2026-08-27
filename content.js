@@ -29,6 +29,7 @@
   let loadingManuallyDismissed = false;
   let stopped = false;
   let probeSequence = 0;
+  let bootstrapFallbackTimer = null;
 
   function send(message) {
     return chrome.runtime.sendMessage(message).catch(() => null);
@@ -766,6 +767,10 @@
   }
 
   function removeLoadingOverlay() {
+    if (bootstrapFallbackTimer) {
+      window.clearTimeout(bootstrapFallbackTimer);
+      bootstrapFallbackTimer = null;
+    }
     loadingHost?.remove();
     loadingHost = null;
     loadingScreen = null;
@@ -1055,7 +1060,7 @@
     return frame;
   }
 
-  async function recoverPending(pending, settings) {
+  async function recoverPending(pending, settings, navigationId = null) {
     if (pending.phase === "lan-discovery") {
       await waitForDocument();
       removeLoadingOverlay();
@@ -1153,12 +1158,27 @@
           "正在通过 FN Connect 官方入口解析 NAS 并选择连接线路…",
           settings
         );
-        window.setTimeout(() => {
+        if (bootstrapFallbackTimer) {
+          window.clearTimeout(bootstrapFallbackTimer);
+          bootstrapFallbackTimer = null;
+        }
+        bootstrapFallbackTimer = window.setTimeout(async () => {
+          bootstrapFallbackTimer = null;
+          if (stopped) {
+            return;
+          }
+          if (!isFnConnectBootstrapPage(pending.bootstrapUrl)) {
+            return;
+          }
           setLoading(
-            "FN Connect 仍在检测连接线路；如需查看详情，可以显示官方页面。",
-            settings,
-            true
+            "FN Connect 自动检测未完成，正在继续恢复会话…",
+            settings
           );
+          await send({
+            type: "BOOTSTRAP_FALLBACK",
+            navigationId,
+            bootstrapUrl: pending.bootstrapUrl
+          });
         }, BOOTSTRAP_PAGE_TIMEOUT_MS);
         return;
       }
@@ -1394,7 +1414,7 @@
     }
 
     if (hello.pending) {
-      await recoverPending(hello.pending, hello.settings);
+      await recoverPending(hello.pending, hello.settings, hello.navigationId);
       return;
     }
 

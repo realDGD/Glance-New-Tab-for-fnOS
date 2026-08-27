@@ -1302,6 +1302,7 @@ async function handleMessage(message, sender) {
     const navContext = await ensureNavigationContext(senderTabId);
     const settings = await loadSettings();
     return {
+      navigationId: navContext?.navigationId ?? null,
       pending: navContext?.pending ?? null,
       settings,
       deviceRoute: await getLanRoute(settings.targetUrl)
@@ -1344,6 +1345,53 @@ async function handleMessage(message, sender) {
       async () => {
         const navContext = await ensureNavigationContext(senderTabId);
         return completeDockerBootstrap(senderTabId, sender.url, false, navContext?.navigationId);
+      }
+    );
+  }
+
+  if (type === "BOOTSTRAP_FALLBACK") {
+    return serializeTabTransition(
+      senderTabId,
+      async () => {
+        const explicitNavigationId = message.navigationId;
+        const navContext = await ensureNavigationContext(senderTabId);
+        const navigationId = explicitNavigationId || navContext?.navigationId;
+        if (!navigationId || !tabNavigations.isActive(senderTabId, navigationId)) {
+          return { action: "ignored" };
+        }
+        const pending = await getPending(senderTabId, navigationId);
+        if (!pending || !isDockerPending(pending) || pending.phase !== "bootstrap") {
+          return { action: "ignored" };
+        }
+
+        let currentTab;
+        try {
+          currentTab = await chrome.tabs.get(senderTabId);
+        } catch {
+          return { action: "ignored" };
+        }
+        const currentUrl = currentTab?.url || sender.url || "";
+        if (!isBootstrapTransitUrl(pending, currentUrl) && !isSamePage(pending.bootstrapUrl, currentUrl)) {
+          return { action: "ignored" };
+        }
+
+        const completion = await completeDockerBootstrap(
+          senderTabId,
+          pending.rootUrl,
+          true,
+          navigationId
+        );
+        if (completion.action !== "bootstrap-complete") {
+          return { action: "ignored" };
+        }
+
+        await navigateOwnedTab(
+          senderTabId,
+          navigationId,
+          pending.rootUrl
+        );
+
+        return { action: "fallback-to-root", pending: completion.pending };
       }
     );
   }

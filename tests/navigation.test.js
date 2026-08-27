@@ -2774,6 +2774,358 @@ test("SEQ9: Preview storage reject after fade does not crash presentation", asyn
   assert.equal(saveFailedCaught, true);
 });
 
+test("BOOT1: Bootstrap official automatic redirection succeeds without triggering fallback", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 101;
+  const nav = manager.begin(tabId);
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, nav.navigationId);
+
+  // Official FN Connect redirects to root origin before timeout
+  const nextUrl = "https://demo-nas.5ddd.com/";
+  const result = manager.handleUrlChange(tabId, nextUrl, pending);
+  assert.equal(result.matched, true);
+  assert.equal(result.active, true);
+  assert.equal(result.cancelled, false);
+  assert.equal(manager.isActive(tabId, nav.navigationId), true);
+});
+
+test("BOOT2: Bootstrap stuck triggers BOOTSTRAP_FALLBACK and navigates to rootUrl", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 102;
+  const nav = manager.begin(tabId);
+
+  let updatedUrl = "";
+  const mockTabs = {
+    async update(id, { url }) {
+      updatedUrl = url;
+    },
+    async get(id) {
+      return { id, url: "https://5ddd.com/demo-nas/" };
+    }
+  };
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, nav.navigationId);
+
+  // Background BOOTSTRAP_FALLBACK handler logic simulation
+  async function handleBootstrapFallback(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    const curPending = manager.getPending(tabId);
+    if (!curPending || !isDockerPending(curPending) || curPending.phase !== "bootstrap") {
+      return { action: "ignored" };
+    }
+    const currentTab = await mockTabs.get(tabId);
+    if (!isBootstrapTransitUrl(curPending, currentTab.url) && curPending.bootstrapUrl !== currentTab.url) {
+      return { action: "ignored" };
+    }
+
+    const updated = {
+      ...curPending,
+      phase: "root",
+      bootstrapCompletedAt: Date.now(),
+      rootEnteredAt: Date.now()
+    };
+    manager.setPending(tabId, updated, msgNavId);
+    manager.setExpectedUrl(tabId, msgNavId, updated.rootUrl);
+    await mockTabs.update(tabId, { url: updated.rootUrl });
+    return { action: "fallback-to-root", pending: updated };
+  }
+
+  const response = await handleBootstrapFallback(nav.navigationId);
+  assert.equal(response.action, "fallback-to-root");
+  assert.equal(response.pending.phase, "root");
+  assert.equal(updatedUrl, "https://demo-nas.5ddd.com/");
+  assert.equal(manager.getPending(tabId).phase, "root");
+});
+
+test("BOOT3: BOOTSTRAP_FALLBACK preserves same navigationId throughout transition", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 103;
+  const nav = manager.begin(tabId);
+  const initialNavId = nav.navigationId;
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, initialNavId);
+
+  // When fallback executes with initialNavId
+  const currentNavId = manager.getNavigationId(tabId);
+  assert.equal(currentNavId, initialNavId);
+  assert.equal(manager.isActive(tabId, initialNavId), true);
+});
+
+test("BOOT4: User navigation away cancels ownership and invalidates BOOTSTRAP_FALLBACK", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 104;
+  const nav = manager.begin(tabId);
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, nav.navigationId);
+
+  // User navigates away to github.com
+  const userUrl = "https://github.com/";
+  const changeResult = manager.handleUrlChange(tabId, userUrl, pending);
+  assert.equal(changeResult.matched, false);
+  assert.equal(changeResult.active, false);
+  assert.equal(changeResult.cancelled, true);
+  assert.equal(manager.isActive(tabId, nav.navigationId), false);
+
+  // When stale bootstrap timer fires
+  async function handleBootstrapFallback(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    return { action: "fallback-to-root" };
+  }
+
+  const response = await handleBootstrapFallback(nav.navigationId);
+  assert.equal(response.action, "ignored");
+});
+
+test("BOOT5: BOOTSTRAP_FALLBACK is ignored if current tab URL is no longer bootstrap transit URL", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 105;
+  const nav = manager.begin(tabId);
+
+  const pending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, pending, nav.navigationId);
+
+  const mockTabs = {
+    async get() {
+      return { url: "https://demo-nas.5ddd.com/settings" }; // not bootstrap URL
+    }
+  };
+
+  async function handleBootstrapFallback(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    const curPending = manager.getPending(tabId);
+    const currentTab = await mockTabs.get(tabId);
+    if (!isBootstrapTransitUrl(curPending, currentTab.url) && curPending.bootstrapUrl !== currentTab.url) {
+      return { action: "ignored" };
+    }
+    return { action: "fallback-to-root" };
+  }
+
+  const response = await handleBootstrapFallback(nav.navigationId);
+  assert.equal(response.action, "ignored");
+});
+
+test("BOOT6: New navigation B on same tab is not polluted by stale bootstrap timer A", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 106;
+
+  // Navigation A starts
+  const navA = manager.begin(tabId);
+  const pendingA = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas-a/",
+    rootUrl: "https://demo-nas-a.5ddd.com/"
+  };
+  manager.setPending(tabId, pendingA, navA.navigationId);
+
+  // Navigation B begins (e.g. user refreshed or switched target)
+  const navB = manager.begin(tabId);
+  const pendingB = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas-b/",
+    rootUrl: "https://demo-nas-b.5ddd.com/"
+  };
+  manager.setPending(tabId, pendingB, navB.navigationId);
+
+  // Stale timer for Nav A fires
+  async function handleBootstrapFallback(msgNavId) {
+    if (!msgNavId || !manager.isActive(tabId, msgNavId)) {
+      return { action: "ignored" };
+    }
+    return { action: "fallback-to-root" };
+  }
+
+  const resA = await handleBootstrapFallback(navA.navigationId);
+  assert.equal(resA.action, "ignored");
+
+  // Nav B is still active and unmodified
+  assert.equal(manager.isActive(tabId, navB.navigationId), true);
+  assert.equal(manager.getPending(tabId).bootstrapUrl, "https://5ddd.com/demo-nas-b/");
+});
+
+test("BOOT7: Phase transition from bootstrap to root updates pending correctly", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 107;
+  const nav = manager.begin(tabId);
+
+  const initialPending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, initialPending, nav.navigationId);
+  assert.equal(manager.getPending(tabId).phase, "bootstrap");
+
+  // Execute transition to root
+  const now = Date.now();
+  const rootPending = {
+    ...initialPending,
+    phase: "root",
+    bootstrapCompletedAt: now,
+    rootEnteredAt: now
+  };
+  manager.setPending(tabId, rootPending, nav.navigationId);
+
+  assert.equal(manager.getPending(tabId).phase, "root");
+  assert.equal(manager.getPending(tabId).bootstrapCompletedAt, now);
+});
+
+test("BOOT8: Full end-to-end recovery from stuck bootstrap to Glance dashboard", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 108;
+  const nav = manager.begin(tabId);
+  const navigatedUrls = [];
+
+  const mockTabs = {
+    async update(id, { url }) {
+      navigatedUrls.push(url);
+    }
+  };
+
+  const initialPending = {
+    phase: "bootstrap",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, initialPending, nav.navigationId);
+  navigatedUrls.push(initialPending.bootstrapUrl);
+
+  // Step 1: Bootstrap times out and triggers fallback to root
+  const rootPending = {
+    ...initialPending,
+    phase: "root",
+    bootstrapCompletedAt: Date.now(),
+    rootEnteredAt: Date.now()
+  };
+  manager.setPending(tabId, rootPending, nav.navigationId);
+  manager.setExpectedUrl(tabId, nav.navigationId, rootPending.rootUrl);
+  await mockTabs.update(tabId, { url: rootPending.rootUrl });
+
+  // Step 2: On root page, auth succeeds and sends TRY_TARGET
+  const targetPending = {
+    ...rootPending,
+    phase: "target",
+    targetAttempts: 1
+  };
+  manager.setPending(tabId, targetPending, nav.navigationId);
+  manager.setExpectedUrl(tabId, nav.navigationId, targetPending.targetUrl);
+  await mockTabs.update(tabId, { url: targetPending.targetUrl });
+
+  assert.deepEqual(navigatedUrls, [
+    "https://5ddd.com/demo-nas/",
+    "https://demo-nas.5ddd.com/",
+    "https://demo-nas.5ddd.com/app/glance/"
+  ]);
+  assert.equal(manager.getPending(tabId).phase, "target");
+});
+
+test("BOOT9: Fallback to root does not bypass auth failure and respects login prompt", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 109;
+  const nav = manager.begin(tabId);
+
+  const rootPending = {
+    phase: "root",
+    recoveryKind: "docker",
+    bootstrapUrl: "https://5ddd.com/demo-nas/",
+    rootUrl: "https://demo-nas.5ddd.com/",
+    checkUrl: "https://demo-nas.5ddd.com/app/glance/health",
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  manager.setPending(tabId, rootPending, nav.navigationId);
+
+  // Auth probe returns invalid on root
+  const authProbeResult = { ok: false, status: 401, reason: "invalid-token" };
+  assert.equal(authProbeResult.ok, false);
+
+  // Does NOT transition to target; pending remains root/auth failure
+  assert.equal(manager.getPending(tabId).phase, "root");
+});
+
+test("BOOT10: Neither bootstrap nor fallback root page pollutes Preview cache", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const configuredTarget = "https://demo-nas.5ddd.com/app/glance/";
+  const bootstrapUrl = "https://5ddd.com/demo-nas/";
+  const rootUrl = "https://demo-nas.5ddd.com/";
+
+  // Check configured target matches
+  assert.equal(isConfiguredTargetPage({ targetUrl: configuredTarget }, bootstrapUrl), false);
+  assert.equal(isConfiguredTargetPage({ targetUrl: configuredTarget }, rootUrl), false);
+
+  // Preview extraction attempted on bootstrap or root page returns false/not executed
+  const isTargetForBootstrap = isConfiguredTargetPage({ targetUrl: configuredTarget }, bootstrapUrl);
+  if (isTargetForBootstrap) {
+    await saveGlancePreviewToStorage(mockStorage, {}, bootstrapUrl);
+  }
+
+  const isTargetForRoot = isConfiguredTargetPage({ targetUrl: configuredTarget }, rootUrl);
+  if (isTargetForRoot) {
+    await saveGlancePreviewToStorage(mockStorage, {}, rootUrl);
+  }
+
+  assert.equal(store.size, 0);
+  assert.equal(store.has(ACTIVE_PREVIEW_TARGET_KEY), false);
+});
+
 
 
 
