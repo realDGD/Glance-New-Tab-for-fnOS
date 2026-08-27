@@ -1,7 +1,17 @@
+import {
+  extractGlancePreview,
+  getPreviewStatus,
+  previewStorageKey,
+  renderGlancePreviewHtml,
+  renderGlanceSkeletonHtml
+} from "./shared.js";
+
 const statusElement = document.querySelector("#status");
 const targetLink = document.querySelector("#target-link");
 const optionsButton = document.querySelector("#open-options");
 const allowLanButton = document.querySelector("#allow-lan");
+const statusCard = document.querySelector("#status-card");
+const previewContainer = document.querySelector("#preview-container");
 
 optionsButton.addEventListener("click", () => {
   void chrome.runtime.openOptionsPage();
@@ -13,7 +23,48 @@ function applyTheme(mode) {
     : "auto";
 }
 
+function showStatusCard() {
+  previewContainer.hidden = true;
+  statusCard.hidden = false;
+}
+
+function showPreview(html) {
+  previewContainer.innerHTML = html;
+  previewContainer.hidden = false;
+  statusCard.hidden = true;
+}
+
+async function renderCachedPreviewOrSkeleton() {
+  try {
+    const all = await chrome.storage.local.get(null);
+    let foundPreview = null;
+    let foundStatus = "none";
+
+    for (const [key, value] of Object.entries(all || {})) {
+      if (key.startsWith("glance-preview:") && value && typeof value === "object") {
+        const status = getPreviewStatus(value);
+        if (status === "fresh" || (status === "stale" && !foundPreview)) {
+          foundPreview = value;
+          foundStatus = status;
+          if (status === "fresh") break;
+        }
+      }
+    }
+
+    if (foundPreview) {
+      applyTheme(foundPreview.theme);
+      showPreview(renderGlancePreviewHtml(foundPreview, foundStatus));
+    } else {
+      showPreview(renderGlanceSkeletonHtml("auto"));
+    }
+  } catch {
+    showPreview(renderGlanceSkeletonHtml("auto"));
+  }
+}
+
 async function start() {
+  await renderCachedPreviewOrSkeleton();
+
   const response = await chrome.runtime.sendMessage({
     type: "OPEN_NEW_TAB"
   });
@@ -25,6 +76,7 @@ async function start() {
   applyTheme(response?.themeMode);
 
   if (response?.action === "configure") {
+    showStatusCard();
     statusElement.textContent = "首次使用，请先填写你的飞牛主页地址。";
     optionsButton.textContent = "开始设置";
     document.body.classList.add("idle");
@@ -32,21 +84,21 @@ async function start() {
   }
 
   if (response?.action === "stay") {
+    showStatusCard();
     statusElement.textContent = "自动打开已暂停，可在扩展设置中重新启用。";
     document.body.classList.add("idle");
     return;
   }
 
   if (response?.action === "recovering-startup") {
-    statusElement.textContent = "浏览器刚刚启动，正在先恢复 fnOS 登录，再进入 Glance…";
+    // Background is recovering session; preview remains visible
   } else if (response?.action === "checking-target") {
-    statusElement.textContent = "正在载入 Glance；只有登录失效时才会进入 fnOS 恢复…";
-  } else {
-    statusElement.textContent = "正在跳转到设定的网址…";
+    // Checking target in background; preview remains visible
   }
 }
 
 async function startLanSetup() {
+  showStatusCard();
   const initial = await chrome.runtime.sendMessage({ type: "GET_SETTINGS" });
   applyTheme(initial?.settings?.themeMode);
   const setup = await chrome.runtime.sendMessage({ type: "GET_LAN_SETUP" });
@@ -55,7 +107,7 @@ async function startLanSetup() {
   }
 
   document.body.classList.add("lan-setup", "idle");
-  document.querySelector("h1").textContent = setup.docker
+  document.querySelector("#headline").textContent = setup.docker
     ? "准备识别 Docker Glance"
     : "准备打开局域网 Glance";
   statusElement.textContent = setup.docker && !setup.hasTarget
@@ -88,7 +140,6 @@ async function startLanSetup() {
         });
       } catch {
         // Chrome 142+ may use this foreground request to ask for Local Network Access.
-        // The fnOS desktop navigation below remains the authoritative connection test.
       }
       statusElement.textContent = setup.docker && !setup.hasTarget
         ? "正在返回 fnOS 桌面；请打开 Docker 中的 Glance…"
@@ -112,6 +163,7 @@ const entry = mode === "lan-setup" ? startLanSetup : start;
 
 entry().catch(async (error) => {
   console.error(error);
+  showStatusCard();
   statusElement.textContent = `打开失败：${error.message}`;
   document.body.classList.add("error");
   try {
@@ -121,6 +173,6 @@ entry().catch(async (error) => {
       targetLink.hidden = false;
     }
   } catch {
-    // 设置也无法读取时保留本地错误页。
+    // Ignore settings load error
   }
 });

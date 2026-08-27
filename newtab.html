@@ -7,9 +7,10 @@
     <link rel="stylesheet" href="newtab.css">
   </head>
   <body>
-    <main class="card">
+    <div id="preview-container" class="preview-container"></div>
+    <main class="card" id="status-card" hidden>
       <div class="mark" aria-hidden="true">G</div>
-      <h1>正在打开主页</h1>
+      <h1 id="headline">正在打开主页</h1>
       <p id="status">正在读取新标签页设置…</p>
       <div class="spinner" aria-hidden="true"></div>
       <button id="allow-lan" class="primary-action" type="button" hidden>允许并继续</button>

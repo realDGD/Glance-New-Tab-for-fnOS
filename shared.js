@@ -1386,3 +1386,230 @@ export class LanRouteStore {
     await s.remove(this.routeKey(key));
   }
 }
+
+export const PREVIEW_KEY_PREFIX = "glance-preview:";
+export const PREVIEW_TTL_FRESH_MS = 30 * 60 * 1000;
+export const PREVIEW_TTL_STALE_MS = 6 * 60 * 60 * 1000;
+
+export function previewStorageKey(targetUrl) {
+  const norm = normalizeNavigableUrl(targetUrl);
+  const parsed = new URL(norm);
+  if (parsed.pathname.length > 1) {
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+  }
+  return `${PREVIEW_KEY_PREFIX}${parsed.href}`;
+}
+
+export function sanitizeSafeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return "";
+  }
+  try {
+    const parsed = new URL(rawUrl, "https://glance.local");
+    const sensitiveParams = [
+      "token", "auth", "key", "secret", "access_token", "ticket",
+      "session", "sig", "signature", "pwd", "password", "code", "refresh_token"
+    ];
+    for (const p of sensitiveParams) {
+      parsed.searchParams.delete(p);
+    }
+    if (sensitiveParams.some((p) => parsed.hash.toLowerCase().includes(p))) {
+      parsed.hash = "";
+    }
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+export function sanitizeSafeText(text, maxLength = 80) {
+  if (!text || typeof text !== "string") {
+    return "";
+  }
+  const clean = text.replace(/[\x00-\x1F\x7F-\x9F]/g, " ").trim();
+  if (/\b(?:bearer\s+[a-zA-Z\d._-]+|access_token|password\s*=|secret\s*=)/i.test(clean)) {
+    return "";
+  }
+  return clean.slice(0, maxLength);
+}
+
+function escapeHtml(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export function extractGlancePreview(rootDocument, targetUrl) {
+  if (!rootDocument || typeof rootDocument.querySelectorAll !== "function") {
+    return null;
+  }
+  try {
+    const title = sanitizeSafeText(rootDocument.title || "Glance", 60);
+    const theme = rootDocument.documentElement?.dataset?.theme
+      || (rootDocument.body?.classList?.contains("dark") ? "dark" : "auto");
+
+    const columnElements = rootDocument.querySelectorAll(".column, [class*='column'], .grid-col");
+    const columns = [];
+
+    const processWidget = (widgetEl) => {
+      if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i]')) {
+        return null;
+      }
+
+      const titleEl = typeof widgetEl.querySelector === "function" ? widgetEl.querySelector("h1, h2, h3, h4, h5, h6, .title, [class*='title']") : null;
+      const widgetTitle = sanitizeSafeText(titleEl?.textContent || "", 50);
+
+      const itemEls = typeof widgetEl.querySelectorAll === "function" ? widgetEl.querySelectorAll("li, a, .item, [class*='item']") : [];
+      const items = [];
+      for (const itemEl of Array.from(itemEls).slice(0, 12)) {
+        const itemText = sanitizeSafeText(itemEl.textContent || "", 60);
+        if (itemText) {
+          const linkHref = itemEl.tagName === "A"
+            ? itemEl.getAttribute?.("href")
+            : (typeof itemEl.querySelector === "function" ? itemEl.querySelector("a")?.getAttribute?.("href") : null);
+          items.push({
+            title: itemText,
+            url: linkHref ? sanitizeSafeUrl(linkHref) : ""
+          });
+        }
+      }
+
+      return {
+        title: widgetTitle,
+        items: items.length > 0 ? items : []
+      };
+    };
+
+    if (columnElements.length > 0) {
+      for (const colEl of Array.from(columnElements).slice(0, 4)) {
+        const widgetEls = colEl.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
+        const widgets = [];
+        for (const w of Array.from(widgetEls).slice(0, 8)) {
+          const parsed = processWidget(w);
+          if (parsed) widgets.push(parsed);
+        }
+        if (widgets.length > 0) {
+          columns.push({ widgets });
+        }
+      }
+    } else {
+      const widgetEls = rootDocument.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
+      const widgets = [];
+      for (const w of Array.from(widgetEls).slice(0, 16)) {
+        const parsed = processWidget(w);
+        if (parsed) widgets.push(parsed);
+      }
+      if (widgets.length > 0) {
+        columns.push({ widgets });
+      }
+    }
+
+    return {
+      version: 1,
+      savedAt: Date.now(),
+      targetUrl: normalizeNavigableUrl(targetUrl),
+      theme,
+      pageTitle: title,
+      columns
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function getPreviewStatus(preview) {
+  if (!preview || typeof preview !== "object" || !preview.savedAt) {
+    return "none";
+  }
+  const age = Date.now() - preview.savedAt;
+  if (age < PREVIEW_TTL_FRESH_MS) {
+    return "fresh";
+  }
+  if (age < PREVIEW_TTL_STALE_MS) {
+    return "stale";
+  }
+  return "expired";
+}
+
+export function renderGlanceSkeletonHtml(themeMode = "auto") {
+  return `
+    <div class="glance-preview-layout skeleton-layout" aria-hidden="true">
+      <div class="glance-preview-header">
+        <div class="glance-skeleton-bar glance-skeleton-title"></div>
+        <div class="glance-skeleton-bar glance-skeleton-time"></div>
+      </div>
+      <div class="glance-preview-columns">
+        <div class="glance-preview-col">
+          <div class="glance-preview-card skeleton-card">
+            <div class="glance-skeleton-bar card-title"></div>
+            <div class="glance-skeleton-bar card-line"></div>
+            <div class="glance-skeleton-bar card-line short"></div>
+          </div>
+          <div class="glance-preview-card skeleton-card">
+            <div class="glance-skeleton-bar card-title"></div>
+            <div class="glance-skeleton-bar card-line"></div>
+          </div>
+        </div>
+        <div class="glance-preview-col">
+          <div class="glance-preview-card skeleton-card">
+            <div class="glance-skeleton-bar card-title"></div>
+            <div class="glance-skeleton-bar card-line"></div>
+            <div class="glance-skeleton-bar card-line"></div>
+          </div>
+        </div>
+        <div class="glance-preview-col">
+          <div class="glance-preview-card skeleton-card">
+            <div class="glance-skeleton-bar card-title"></div>
+            <div class="glance-skeleton-bar card-line short"></div>
+          </div>
+          <div class="glance-preview-card skeleton-card">
+            <div class="glance-skeleton-bar card-title"></div>
+            <div class="glance-skeleton-bar card-line"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+export function renderGlancePreviewHtml(preview, status = "fresh") {
+  if (!preview || !Array.isArray(preview.columns) || preview.columns.length === 0) {
+    return renderGlanceSkeletonHtml(preview?.theme || "auto");
+  }
+  const staleNotice = status === "stale"
+    ? `<div class="glance-preview-stale-badge">缓存预览 · 正在刷新</div>`
+    : "";
+
+  const columnsHtml = preview.columns.map((col) => {
+    const widgetsHtml = (col.widgets || []).map((w) => {
+      const titleHtml = w.title ? `<div class="glance-card-header">${escapeHtml(w.title)}</div>` : "";
+      const itemsHtml = (w.items || []).map((item) => `
+        <div class="glance-card-item">
+          <span class="glance-card-item-title">${escapeHtml(item.title)}</span>
+        </div>
+      `).join("");
+      return `
+        <div class="glance-preview-card">
+          ${titleHtml}
+          <div class="glance-card-body">${itemsHtml}</div>
+        </div>
+      `;
+    }).join("");
+    return `<div class="glance-preview-col">${widgetsHtml}</div>`;
+  }).join("");
+
+  return `
+    <div class="glance-preview-layout" aria-hidden="true">
+      <div class="glance-preview-header">
+        <div class="glance-preview-title">${escapeHtml(preview.pageTitle || "Glance")}</div>
+        ${staleNotice}
+      </div>
+      <div class="glance-preview-columns">
+        ${columnsHtml}
+      </div>
+    </div>
+  `;
+}

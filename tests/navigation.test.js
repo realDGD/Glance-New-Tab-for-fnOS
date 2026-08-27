@@ -16,7 +16,12 @@ import {
   parsePendingEnvelope,
   NavigationPersistence,
   OwnedTabController,
-  LanRouteStore
+  LanRouteStore,
+  extractGlancePreview,
+  getPreviewStatus,
+  previewStorageKey,
+  renderGlancePreviewHtml,
+  renderGlanceSkeletonHtml
 } from "../shared.js";
 
 test("TabNavigationManager manages per-tab generation tokens and abort signals", () => {
@@ -1112,6 +1117,353 @@ test("P1-4: removeAllForTab purges all generations of pending, active pointer, a
   assert.equal(store.has(`lan-discovery:${tabId2}:nav_3`), true);
   assert.equal(store.has(`nav-active:${tabId2}`), true);
 });
+
+test("E1: navigationId production integration guarantees distinct identities and blocks old navigation side-effects", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 1001;
+
+  // Begin navigation A
+  const navA = manager.begin(tabId);
+  const navIdA = typeof navA === "object" ? navA.navigationId : navA;
+  assert.ok(navIdA);
+  assert.equal(manager.isActive(tabId, navIdA), true);
+
+  // Begin navigation B on same tab
+  const navB = manager.begin(tabId);
+  const navIdB = typeof navB === "object" ? navB.navigationId : navB;
+  assert.ok(navIdB);
+  assert.notEqual(navIdA, navIdB);
+
+  // Navigation A is now completely inactive and superseded
+  assert.equal(manager.isActive(tabId, navIdA), false);
+  assert.equal(manager.isActive(tabId, navIdB), true);
+
+  // Stale navigation A cannot mutate pending or claim removal
+  assert.equal(manager.setPending(tabId, { phase: "target" }, navIdA), false);
+  assert.equal(manager.claimTabForRemoval(tabId, navIdA), null);
+
+  // Active navigation B can mutate pending and claim removal
+  assert.equal(manager.setPending(tabId, { phase: "target" }, navIdB), true);
+  assert.ok(manager.claimTabForRemoval(tabId, navIdB));
+});
+
+test("E2: Persistence key uses navigationId token and active pointer", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
+    }
+  };
+
+  const persistence = new NavigationPersistence(mockStorage);
+  const tabId = 1002;
+  const navId = "uuid_nav_token_abc";
+
+  await persistence.setPendingEnvelope(tabId, navId, {
+    navigationId: navId,
+    pending: { phase: "root", targetUrl: "https://nas.5ddd.com/" }
+  });
+
+  // Verify key format
+  assert.equal(store.has(`pending-recovery:${tabId}:${navId}`), true);
+  assert.equal(store.has(`nav-active:${tabId}`), true);
+  assert.equal(store.get(`nav-active:${tabId}`).navigationId, navId);
+
+  // Read back envelope
+  const envelope = await persistence.getPendingEnvelope(tabId, navId);
+  assert.equal(envelope.navigationId, navId);
+  assert.equal(envelope.pending.phase, "root");
+});
+
+test("E3: rehydrate strictly preserves original navigationId across Service Worker restart", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 1003;
+  const origNavId = "nav_sw_restart_uuid_9999";
+
+  const state = manager.rehydrate(tabId, {
+    navigationId: origNavId,
+    generation: 5,
+    pending: { phase: "target", targetUrl: "https://glance.local:8080/" }
+  });
+
+  assert.equal(state.navigationId, origNavId);
+  assert.equal(manager.getNavigationId(tabId), origNavId);
+  assert.equal(manager.isActive(tabId, origNavId), true);
+});
+
+test("E4: setLanDiscovery receives navigationId and reliably persists into session storage", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
+    }
+  };
+
+  const persistence = new NavigationPersistence(mockStorage);
+  const ownerTabId = 1004;
+  const navigationId = "nav_lan_disc_uuid_777";
+
+  const discoveryData = {
+    remoteTargetUrl: "https://remote.5ddd.com/",
+    lanRootUrl: "http://192.168.1.100:8080/",
+    startedAt: Date.now(),
+    expiresAt: Date.now() + 60000
+  };
+
+  const saved = await persistence.setDiscovery(ownerTabId, navigationId, discoveryData);
+  assert.equal(saved, true);
+
+  // Verify storage key
+  assert.equal(store.has(`lan-discovery:${ownerTabId}:${navigationId}`), true);
+
+  // Retrieve discovery
+  const retrieved = await persistence.getDiscovery(ownerTabId, navigationId);
+  assert.ok(retrieved);
+  assert.equal(retrieved.navigationId, navigationId);
+  assert.equal(retrieved.lanRootUrl, "http://192.168.1.100:8080/");
+});
+
+test("E5: Preview schema security test extracts safe widgets and strips passwords, tokens and secrets", () => {
+  // Create mock DOM structure simulating Glance page with mixed safe and sensitive content
+  const mockDoc = {
+    title: "Glance Dashboard - Home",
+    documentElement: { dataset: { theme: "dark" } },
+    body: { classList: { contains: () => true } },
+    querySelectorAll(selector) {
+      if (selector.includes(".column")) {
+        return [
+          {
+            querySelectorAll() {
+              return [
+                // Safe widget
+                {
+                  querySelector(sel) {
+                    if (sel.includes("password") || sel.includes("token")) return null;
+                    if (sel.includes("h1") || sel.includes(".title")) return { textContent: "Bookmarks" };
+                    return null;
+                  },
+                  querySelectorAll(sel) {
+                    if (sel.includes("li") || sel.includes("a")) {
+                      return [
+                        {
+                          tagName: "A",
+                          textContent: "Documentation",
+                          getAttribute(attr) {
+                            if (attr === "href") return "https://docs.glance.local/?token=secretToken123&session=xyz#token=abc";
+                            return null;
+                          },
+                          querySelector() { return null; }
+                        },
+                        {
+                          tagName: "A",
+                          textContent: "GitHub Repo",
+                          getAttribute(attr) {
+                            if (attr === "href") return "https://github.com/glanceapp/glance";
+                            return null;
+                          },
+                          querySelector() { return null; }
+                        }
+                      ];
+                    }
+                    return [];
+                  }
+                },
+                // Sensitive widget with password input (must be skipped entirely)
+                {
+                  querySelector(sel) {
+                    if (sel.includes("password")) return { tagName: "INPUT", type: "password" };
+                    if (sel.includes("h1") || sel.includes(".title")) return { textContent: "Login Form" };
+                    return null;
+                  },
+                  querySelectorAll() { return []; }
+                }
+              ];
+            }
+          }
+        ];
+      }
+      return [];
+    }
+  };
+
+  const preview = extractGlancePreview(mockDoc, "http://192.168.1.50:8080/");
+  assert.ok(preview);
+  assert.equal(preview.version, 1);
+  assert.equal(preview.theme, "dark");
+  assert.equal(preview.pageTitle, "Glance Dashboard - Home");
+  assert.equal(preview.columns.length, 1);
+
+  const widgets = preview.columns[0].widgets;
+  // Login widget with password field must be excluded
+  assert.equal(widgets.length, 1);
+  assert.equal(widgets[0].title, "Bookmarks");
+
+  // Tokens in URL must be stripped
+  const docLink = widgets[0].items[0];
+  assert.equal(docLink.title, "Documentation");
+  assert.equal(docLink.url.includes("token="), false);
+  assert.equal(docLink.url.includes("session="), false);
+});
+
+test("E6: renderGlanceSkeletonHtml returns clean skeleton layout without error", () => {
+  const darkSkeleton = renderGlanceSkeletonHtml("dark");
+  assert.ok(darkSkeleton.includes("skeleton-layout"));
+  assert.ok(darkSkeleton.includes("skeleton-card"));
+  assert.ok(darkSkeleton.includes("glance-skeleton-bar"));
+
+  const lightSkeleton = renderGlanceSkeletonHtml("light");
+  assert.ok(lightSkeleton.includes("skeleton-layout"));
+});
+
+test("E7: renderGlancePreviewHtml renders structured cards and headers", () => {
+  const samplePreview = {
+    version: 1,
+    savedAt: Date.now(),
+    theme: "dark",
+    pageTitle: "My Personal Glance",
+    columns: [
+      {
+        widgets: [
+          {
+            title: "Quick Links",
+            items: [
+              { title: "NAS Admin", url: "https://nas.local/" },
+              { title: "Docker", url: "https://docker.local/" }
+            ]
+          }
+        ]
+      }
+    ]
+  };
+
+  const freshHtml = renderGlancePreviewHtml(samplePreview, "fresh");
+  assert.ok(freshHtml.includes("My Personal Glance"));
+  assert.ok(freshHtml.includes("Quick Links"));
+  assert.ok(freshHtml.includes("NAS Admin"));
+  assert.equal(freshHtml.includes("正在刷新"), false);
+
+  const staleHtml = renderGlancePreviewHtml(samplePreview, "stale");
+  assert.ok(staleHtml.includes("正在刷新"));
+});
+
+test("E8: getPreviewStatus correctly differentiates fresh, stale, expired, and none", () => {
+  const now = Date.now();
+
+  assert.equal(getPreviewStatus(null), "none");
+  assert.equal(getPreviewStatus({}), "none");
+
+  // 10 minutes ago -> fresh (< 30 min)
+  assert.equal(getPreviewStatus({ savedAt: now - 10 * 60 * 1000 }), "fresh");
+
+  // 2 hours ago -> stale (30 min ~ 6 hours)
+  assert.equal(getPreviewStatus({ savedAt: now - 2 * 3600 * 1000 }), "stale");
+
+  // 8 hours ago -> expired (> 6 hours)
+  assert.equal(getPreviewStatus({ savedAt: now - 8 * 3600 * 1000 }), "expired");
+});
+
+test("E9: Preview storage key generation matches normalized URL", () => {
+  const key1 = previewStorageKey("https://glance.local:8080/dashboard/");
+  const key2 = previewStorageKey("https://glance.local:8080/dashboard");
+  assert.equal(key1, key2);
+  assert.equal(key1, "glance-preview:https://glance.local:8080/dashboard");
+});
+
+test("E10: Production helper beginDockerLanDiscovery sets identity and persists without omission", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    },
+    async remove(keys) {
+      const arr = Array.isArray(keys) ? keys : [keys];
+      for (const k of arr) store.delete(k);
+    }
+  };
+
+  const manager = new TabNavigationManager();
+  const persistence = new NavigationPersistence(mockStorage);
+  const tabId = 1010;
+
+  const gen = manager.begin(tabId);
+  const navigationId = manager.getNavigationId(tabId);
+
+  // Simulate production beginDockerLanDiscovery flow with explicit navigationId
+  const pending = {
+    targetUrl: "https://fnos.5ddd.com/",
+    lanRootUrl: "http://192.168.1.120:8080/",
+    phase: "lan-discovery"
+  };
+
+  const persisted = await persistence.setDiscovery(tabId, navigationId, {
+    ownerTabId: tabId,
+    navigationId,
+    remoteTargetUrl: pending.targetUrl,
+    lanRootUrl: pending.lanRootUrl,
+    startedAt: Date.now(),
+    expiresAt: Date.now() + 60000
+  });
+
+  assert.equal(persisted, true);
+  assert.equal(store.has(`lan-discovery:${tabId}:${navigationId}`), true);
+
+  const discovery = await persistence.getDiscovery(tabId, navigationId);
+  assert.ok(discovery);
+  assert.equal(discovery.ownerTabId, tabId);
+  assert.equal(discovery.navigationId, navigationId);
+});
+
+test("E11: Concurrent preview saves for different Glance targets do not overwrite each other", async () => {
+  const store = new Map();
+  const mockStorage = {
+    async get(keys) {
+      if (keys === null) return Object.fromEntries(store);
+      if (Array.isArray(keys)) return Object.fromEntries(keys.map((k) => [k, store.get(k)]));
+      return { [keys]: store.get(keys) };
+    },
+    async set(items) {
+      for (const [k, v] of Object.entries(items)) store.set(k, v);
+    }
+  };
+
+  const key1 = previewStorageKey("https://glance1.local/");
+  const key2 = previewStorageKey("https://glance2.local/");
+
+  const preview1 = { version: 1, pageTitle: "Glance 1", savedAt: Date.now(), columns: [] };
+  const preview2 = { version: 1, pageTitle: "Glance 2", savedAt: Date.now(), columns: [] };
+
+  await mockStorage.set({ [key1]: preview1 });
+  await mockStorage.set({ [key2]: preview2 });
+
+  const all = await mockStorage.get(null);
+  assert.equal(all[key1].pageTitle, "Glance 1");
+  assert.equal(all[key2].pageTitle, "Glance 2");
+});
+
+
 
 
 

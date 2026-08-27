@@ -390,11 +390,159 @@
     loadingButton?.classList.toggle("visible", showPageButton);
   }
 
+  function normalizeNavigableUrl(value) {
+    const parsed = new URL(value);
+    if (!new Set(["http:", "https:"]).has(parsed.protocol)) {
+      throw new Error("只支持 HTTP 或 HTTPS 网址");
+    }
+    parsed.hash = "";
+    if (parsed.pathname.length > 1) {
+      parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+    }
+    return parsed.href;
+  }
+
+  function sanitizeSafeUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== "string") {
+      return "";
+    }
+    try {
+      const parsed = new URL(rawUrl, "https://glance.local");
+      const sensitiveParams = [
+        "token", "auth", "key", "secret", "access_token", "ticket",
+        "session", "sig", "signature", "pwd", "password", "code", "refresh_token"
+      ];
+      for (const p of sensitiveParams) {
+        parsed.searchParams.delete(p);
+      }
+      if (sensitiveParams.some((p) => parsed.hash.toLowerCase().includes(p))) {
+        parsed.hash = "";
+      }
+      return parsed.href;
+    } catch {
+      return "";
+    }
+  }
+
+  function sanitizeSafeText(text, maxLength = 80) {
+    if (!text || typeof text !== "string") {
+      return "";
+    }
+    const clean = text.replace(/[\x00-\x1F\x7F-\x9F]/g, " ").trim();
+    if (/\b(?:bearer\s+[a-zA-Z\d._-]+|access_token|password\s*=|secret\s*=)/i.test(clean)) {
+      return "";
+    }
+    return clean.slice(0, maxLength);
+  }
+
+  function extractGlancePreview(rootDocument, targetUrl) {
+    if (!rootDocument || typeof rootDocument.querySelectorAll !== "function") {
+      return null;
+    }
+    try {
+      const title = sanitizeSafeText(rootDocument.title || "Glance", 60);
+      const theme = rootDocument.documentElement?.dataset?.theme
+        || (rootDocument.body?.classList?.contains("dark") ? "dark" : "auto");
+
+      const columnElements = rootDocument.querySelectorAll(".column, [class*='column'], .grid-col");
+      const columns = [];
+
+      const processWidget = (widgetEl) => {
+        if (typeof widgetEl.querySelector === "function" && widgetEl.querySelector('input[type="password"], input[name*="password" i], input[name*="token" i]')) {
+          return null;
+        }
+
+        const titleEl = typeof widgetEl.querySelector === "function" ? widgetEl.querySelector("h1, h2, h3, h4, h5, h6, .title, [class*='title']") : null;
+        const widgetTitle = sanitizeSafeText(titleEl?.textContent || "", 50);
+
+        const itemEls = typeof widgetEl.querySelectorAll === "function" ? widgetEl.querySelectorAll("li, a, .item, [class*='item']") : [];
+        const items = [];
+        for (const itemEl of Array.from(itemEls).slice(0, 12)) {
+          const itemText = sanitizeSafeText(itemEl.textContent || "", 60);
+          if (itemText) {
+            const linkHref = itemEl.tagName === "A"
+              ? itemEl.getAttribute?.("href")
+              : (typeof itemEl.querySelector === "function" ? itemEl.querySelector("a")?.getAttribute?.("href") : null);
+            items.push({
+              title: itemText,
+              url: linkHref ? sanitizeSafeUrl(linkHref) : ""
+            });
+          }
+        }
+
+        return {
+          title: widgetTitle,
+          items: items.length > 0 ? items : []
+        };
+      };
+
+      if (columnElements.length > 0) {
+        for (const colEl of Array.from(columnElements).slice(0, 4)) {
+          const widgetEls = colEl.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
+          const widgets = [];
+          for (const w of Array.from(widgetEls).slice(0, 8)) {
+            const parsed = processWidget(w);
+            if (parsed) widgets.push(parsed);
+          }
+          if (widgets.length > 0) {
+            columns.push({ widgets });
+          }
+        }
+      } else {
+        const widgetEls = rootDocument.querySelectorAll(".widget, .card, [class*='widget'], [class*='card']");
+        const widgets = [];
+        for (const w of Array.from(widgetEls).slice(0, 16)) {
+          const parsed = processWidget(w);
+          if (parsed) widgets.push(parsed);
+        }
+        if (widgets.length > 0) {
+          columns.push({ widgets });
+        }
+      }
+
+      return {
+        version: 1,
+        savedAt: Date.now(),
+        targetUrl: normalizeNavigableUrl(targetUrl),
+        theme,
+        pageTitle: title,
+        columns
+      };
+    } catch {
+      return null;
+    }
+  }
+
   function removeLoadingOverlay() {
     loadingHost?.remove();
     loadingHost = null;
     loadingText = null;
     loadingButton = null;
+  }
+
+  function fadeOutLoadingOverlay(onComplete = null) {
+    if (!loadingHost) {
+      onComplete?.();
+      return;
+    }
+    const host = loadingHost;
+    const shadow = host.shadowRoot;
+    const screen = shadow?.querySelector(".screen");
+    if (screen) {
+      screen.style.transition = "opacity 140ms ease-out";
+      screen.style.opacity = "0";
+      window.setTimeout(() => {
+        if (loadingHost === host) {
+          removeLoadingOverlay();
+        } else {
+          host.remove();
+        }
+        onComplete?.();
+      }, 150);
+    } else {
+      removeLoadingOverlay();
+      onComplete?.();
+    }
   }
 
   async function waitForVisualReady() {
@@ -697,13 +845,26 @@
       stopped = true;
       setLoading("Glance 已就绪。", settings);
       await send({ type: "TARGET_READY" });
+
+      try {
+        const preview = extractGlancePreview(document, pending.targetUrl);
+        if (preview && preview.columns?.length > 0) {
+          const key = `glance-preview:${normalizeNavigableUrl(pending.targetUrl)}`;
+          await chrome.storage.local.set({ [key]: preview });
+        }
+      } catch {
+        // Ignore preview save error
+      }
+
       await startKeepAlive(
         pending.recoveryKind === "native-lan"
           ? { ...settings, healthUrl: pending.checkUrl }
           : settings
       );
-      await new Promise((resolve) => window.setTimeout(resolve, COMPLETION_HOLD_MS));
-      removeLoadingOverlay();
+      await new Promise((resolve) => window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(resolve);
+      }));
+      fadeOutLoadingOverlay();
       return;
     }
 
