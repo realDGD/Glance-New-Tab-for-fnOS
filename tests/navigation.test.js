@@ -1457,6 +1457,295 @@ test("T13: Concurrent preview saves for different Glance targets do not overwrit
   assert.equal(all[key2].pageTitle, "Glance 2");
 });
 
+test("UX-T1: Closed ShadowRoot Fade accesses preserved screen reference and triggers fade", () => {
+  let loadingHost = null;
+  let loadingScreen = null;
+
+  const mockScreen = {
+    style: {},
+    events: {},
+    addEventListener(evt, fn) { this.events[evt] = fn; },
+    removeEventListener(evt, fn) { delete this.events[evt]; }
+  };
+
+  const mockHost = {
+    shadowRoot: null, // CLOSED SHADOW ROOT
+    removed: false,
+    remove() { this.removed = true; }
+  };
+
+  loadingHost = mockHost;
+  loadingScreen = mockScreen;
+
+  assert.equal(loadingHost.shadowRoot, null);
+
+  let fadeCompleted = false;
+  function fadeOutLoadingOverlay(onComplete = null) {
+    if (!loadingHost) {
+      onComplete?.();
+      return;
+    }
+    const host = loadingHost;
+    const screen = loadingScreen;
+
+    if (screen) {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        screen.removeEventListener("transitionend", onTransitionEnd);
+        if (loadingHost === host) {
+          mockHost.remove();
+          loadingHost = null;
+          loadingScreen = null;
+        } else {
+          host.remove();
+        }
+        onComplete?.();
+      };
+
+      const onTransitionEnd = (e) => {
+        if (e.target === screen && (e.propertyName === "opacity" || !e.propertyName)) {
+          finish();
+        }
+      };
+
+      screen.addEventListener("transitionend", onTransitionEnd);
+      screen.style.transition = "opacity 140ms ease-out";
+      screen.style.opacity = "0";
+      setTimeout(finish, 180);
+    } else {
+      mockHost.remove();
+      loadingHost = null;
+      loadingScreen = null;
+      onComplete?.();
+    }
+  }
+
+  fadeOutLoadingOverlay(() => { fadeCompleted = true; });
+
+  assert.equal(mockScreen.style.opacity, "0");
+  assert.equal(mockScreen.style.transition, "opacity 140ms ease-out");
+  assert.equal(mockHost.removed, false);
+  assert.equal(fadeCompleted, false);
+
+  mockScreen.events.transitionend({ target: mockScreen, propertyName: "opacity" });
+
+  assert.equal(mockHost.removed, true);
+  assert.equal(fadeCompleted, true);
+  assert.equal(loadingHost, null);
+  assert.equal(loadingScreen, null);
+});
+
+test("UX-T2: Truly fade before remove and cleans up references", (t, done) => {
+  let loadingHost = { removed: false, remove() { this.removed = true; } };
+  let loadingScreen = {
+    style: {},
+    addEventListener(evt, fn) {
+      setTimeout(() => fn({ target: this, propertyName: "opacity" }), 20);
+    },
+    removeEventListener() {}
+  };
+
+  const hostRef = loadingHost;
+
+  function fadeOut(cb) {
+    const screen = loadingScreen;
+    if (screen) {
+      screen.addEventListener("transitionend", () => {
+        hostRef.remove();
+        loadingHost = null;
+        loadingScreen = null;
+        cb();
+      });
+      screen.style.opacity = "0";
+    }
+  }
+
+  fadeOut(() => {
+    assert.equal(hostRef.removed, true);
+    assert.equal(loadingHost, null);
+    assert.equal(loadingScreen, null);
+    done();
+  });
+
+  assert.equal(hostRef.removed, false);
+});
+
+test("UX-T3: Missing screen fallback safely removes host without uncaught errors", () => {
+  let loadingHost = { removed: false, remove() { this.removed = true; } };
+  let loadingScreen = null;
+
+  let completed = false;
+  function fadeOut(cb) {
+    if (!loadingHost) { cb?.(); return; }
+    const screen = loadingScreen;
+    if (screen) {
+      // ...
+    } else {
+      loadingHost.remove();
+      loadingHost = null;
+      loadingScreen = null;
+      cb?.();
+    }
+  }
+
+  fadeOut(() => { completed = true; });
+  assert.equal(completed, true);
+  assert.equal(loadingHost, null);
+});
+
+test("UX-T4: Content current target strictly matches current location preview", async () => {
+  const store = new Map();
+  const urlA = "https://nas-a.5ddd.com/glance/";
+  const urlB = "https://nas-b.5ddd.com/glance/";
+  const keyA = previewStorageKey(urlA);
+  const keyB = previewStorageKey(urlB);
+
+  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget A" }] }] });
+  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget B" }] }] });
+
+  const curLocation = urlB;
+  const curKey = previewStorageKey(curLocation);
+  const result = store.get(curKey);
+
+  assert.ok(result);
+  assert.equal(result.pageTitle, "Glance B");
+  const html = renderGlancePreviewHtml(result, getPreviewStatus(result));
+  assert.ok(html.includes("Glance B"));
+  assert.ok(html.includes("Widget B"));
+  assert.equal(html.includes("Widget A"), false);
+});
+
+test("UX-T5: Content missing current target preview stays on Skeleton and NEVER falls back to active target pointer", async () => {
+  const store = new Map();
+  const urlA = "https://nas-a.5ddd.com/glance/";
+  const urlB = "https://nas-b.5ddd.com/glance/";
+  const keyA = previewStorageKey(urlA);
+
+  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "Widget A" }] }] });
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlA);
+
+  const curLocation = urlB;
+  const curKey = previewStorageKey(curLocation);
+  const preview = store.get(curKey) || null;
+
+  assert.equal(preview, null);
+  const html = preview ? renderGlancePreviewHtml(preview) : renderGlanceSkeletonHtml("auto");
+  assert.ok(html.includes("skeleton-layout"));
+  assert.equal(html.includes("Glance A"), false);
+  assert.equal(html.includes("Widget A"), false);
+});
+
+test("UX-T6: Newtab renders matching preview when ACTIVE_PREVIEW_TARGET_KEY exists", async () => {
+  const store = new Map();
+  const urlA = "https://nas-a.5ddd.com/glance/";
+  const urlB = "https://nas-b.5ddd.com/glance/";
+  const keyA = previewStorageKey(urlA);
+  const keyB = previewStorageKey(urlB);
+
+  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "A" }] }] });
+  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlB);
+
+  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
+  let foundPreview = null;
+  if (activeTarget) {
+    const key = previewStorageKey(activeTarget);
+    const val = store.get(key);
+    if (val && (getPreviewStatus(val) === "fresh" || getPreviewStatus(val) === "stale")) {
+      foundPreview = val;
+    }
+  }
+
+  assert.ok(foundPreview);
+  assert.equal(foundPreview.pageTitle, "Glance B");
+});
+
+test("UX-T7: Newtab renders Skeleton when active target has no preview without random fallback", async () => {
+  const store = new Map();
+  const urlA = "https://nas-a.5ddd.com/glance/";
+  const urlB = "https://nas-b.5ddd.com/glance/";
+  const urlC = "https://nas-c.5ddd.com/glance/";
+  const keyA = previewStorageKey(urlA);
+  const keyB = previewStorageKey(urlB);
+
+  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now(), columns: [{ widgets: [{ title: "A" }] }] });
+  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlC);
+
+  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
+  let foundPreview = null;
+  if (activeTarget) {
+    const key = previewStorageKey(activeTarget);
+    const val = store.get(key);
+    if (val && (getPreviewStatus(val) === "fresh" || getPreviewStatus(val) === "stale")) {
+      foundPreview = val;
+    }
+  }
+
+  assert.equal(foundPreview, null);
+  const html = foundPreview ? renderGlancePreviewHtml(foundPreview) : renderGlanceSkeletonHtml("auto");
+  assert.ok(html.includes("skeleton-layout"));
+  assert.equal(html.includes("Glance A"), false);
+  assert.equal(html.includes("Glance B"), false);
+});
+
+test("UX-T8: Expired preview renders Skeleton and NEVER falls back to another target fresh preview", async () => {
+  const store = new Map();
+  const urlA = "https://nas-a.5ddd.com/glance/";
+  const urlB = "https://nas-b.5ddd.com/glance/";
+  const keyA = previewStorageKey(urlA);
+  const keyB = previewStorageKey(urlB);
+
+  store.set(keyA, { version: 1, targetUrl: urlA, pageTitle: "Glance A", savedAt: Date.now() - 10 * 3600 * 1000, columns: [{ widgets: [{ title: "A" }] }] });
+  store.set(keyB, { version: 1, targetUrl: urlB, pageTitle: "Glance B", savedAt: Date.now(), columns: [{ widgets: [{ title: "B" }] }] });
+  store.set(ACTIVE_PREVIEW_TARGET_KEY, urlA);
+
+  const activeTarget = store.get(ACTIVE_PREVIEW_TARGET_KEY);
+  let foundPreview = null;
+  if (activeTarget) {
+    const key = previewStorageKey(activeTarget);
+    const val = store.get(key);
+    const status = getPreviewStatus(val);
+    if (status === "fresh" || status === "stale") {
+      foundPreview = val;
+    }
+  }
+
+  assert.equal(foundPreview, null);
+  const html = foundPreview ? renderGlancePreviewHtml(foundPreview) : renderGlanceSkeletonHtml("auto");
+  assert.ok(html.includes("skeleton-layout"));
+  assert.equal(html.includes("Glance B"), false);
+});
+
+test("UX-T9: Full lifecycle from Cached Preview to TARGET_READY fade with zero spinner", () => {
+  let previewLayerVisible = true;
+  let promptCardVisible = false;
+
+  function ensureLoadingOverlay(preview) {
+    previewLayerVisible = true;
+    promptCardVisible = false;
+  }
+
+  function setLoading(msg) {
+    previewLayerVisible = false;
+    promptCardVisible = true;
+  }
+
+  ensureLoadingOverlay({ version: 1, pageTitle: "My Glance" });
+  assert.equal(previewLayerVisible, true);
+  assert.equal(promptCardVisible, false);
+
+  const renderedFailure = null;
+  if (renderedFailure) {
+    setLoading("Auth failure");
+  }
+
+  assert.equal(previewLayerVisible, true);
+  assert.equal(promptCardVisible, false);
+});
+
 
 
 

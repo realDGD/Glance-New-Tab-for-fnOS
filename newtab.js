@@ -54,20 +54,6 @@ async function renderCachedPreviewOrSkeleton() {
       }
     }
 
-    if (!foundPreview) {
-      const all = await chrome.storage.local.get(null);
-      for (const [key, value] of Object.entries(all || {})) {
-        if (key.startsWith("glance-preview:") && value && typeof value === "object") {
-          const status = getPreviewStatus(value);
-          if (status === "fresh" || (status === "stale" && !foundPreview)) {
-            foundPreview = value;
-            foundStatus = status;
-            if (status === "fresh") break;
-          }
-        }
-      }
-    }
-
     if (foundPreview) {
       applyTheme(foundPreview.theme);
       showPreview(renderGlancePreviewHtml(foundPreview, foundStatus));

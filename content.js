@@ -21,8 +21,11 @@
   let badgeText;
   let badgeButton;
   let loadingHost;
+  let loadingScreen;
   let loadingText;
   let loadingButton;
+  let previewLayer;
+  let promptCard;
   let loadingManuallyDismissed = false;
   let stopped = false;
   let probeSequence = 0;
@@ -670,18 +673,14 @@
     host.style.setProperty("all", "initial", "important");
     document.documentElement.append(host);
     loadingHost = host;
+    loadingScreen = screen;
 
-    // Asynchronously check storage for current location preview to update skeleton into cached preview
+    // Asynchronously check storage for current location preview ONLY (no cross-target fallback)
     void (async () => {
       try {
         const curKey = previewStorageKey(location.href);
-        const stored = await chrome.storage.local.get([curKey, ACTIVE_PREVIEW_TARGET_KEY]);
-        let preview = stored?.[curKey];
-        if (!preview && stored?.[ACTIVE_PREVIEW_TARGET_KEY]) {
-          const activeKey = previewStorageKey(stored[ACTIVE_PREVIEW_TARGET_KEY]);
-          const activeRes = await chrome.storage.local.get([activeKey]);
-          preview = activeRes?.[activeKey];
-        }
+        const stored = await chrome.storage.local.get([curKey]);
+        const preview = stored?.[curKey];
         if (preview && previewLayer && (!promptCard || promptCard.style.display === "none" || !promptCard.style.display)) {
           const status = getPreviewStatus(preview);
           if (status === "fresh" || status === "stale") {
@@ -720,6 +719,7 @@
   function removeLoadingOverlay() {
     loadingHost?.remove();
     loadingHost = null;
+    loadingScreen = null;
     loadingText = null;
     loadingButton = null;
     previewLayer = null;
@@ -732,19 +732,36 @@
       return;
     }
     const host = loadingHost;
-    const shadow = host.shadowRoot;
-    const screen = shadow?.querySelector(".screen");
+    const screen = loadingScreen;
+
     if (screen) {
-      screen.style.transition = "opacity 140ms ease-out";
-      screen.style.opacity = "0";
-      window.setTimeout(() => {
+      let finished = false;
+      const finish = () => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        screen.removeEventListener("transitionend", onTransitionEnd);
         if (loadingHost === host) {
           removeLoadingOverlay();
         } else {
           host.remove();
         }
         onComplete?.();
-      }, 150);
+      };
+
+      const onTransitionEnd = (e) => {
+        if (e.target === screen && (e.propertyName === "opacity" || !e.propertyName)) {
+          finish();
+        }
+      };
+
+      screen.addEventListener("transitionend", onTransitionEnd);
+      screen.style.transition = "opacity 140ms ease-out";
+      screen.style.opacity = "0";
+
+      // Fallback timer in case transitionend does not fire
+      window.setTimeout(finish, 180);
     } else {
       removeLoadingOverlay();
       onComplete?.();

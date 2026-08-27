@@ -1,4 +1,5 @@
 import {
+  ACTIVE_PREVIEW_TARGET_KEY,
   DEFAULT_SETTINGS,
   hostPermissionPattern,
   inferFnOsHealthUrl,
@@ -190,6 +191,13 @@ async function save() {
     if (!lanAccessResult.granted) {
       throw new Error("未获得这台 NAS 的局域网访问权限");
     }
+    if (renderedRemoteTarget && settings.targetUrl !== renderedRemoteTarget) {
+      try {
+        await chrome.storage.local.remove(ACTIVE_PREVIEW_TARGET_KEY);
+      } catch {
+        // Ignore
+      }
+    }
     await chrome.storage.sync.set(settings);
     const routeResponse = await chrome.runtime.sendMessage({
       type: "SAVE_DEVICE_LAN_TARGET",
@@ -255,6 +263,7 @@ resetButton.addEventListener("click", () => {
   if (!window.confirm("确定清除当前地址并恢复首次使用状态吗？")) {
     return;
   }
+  void chrome.storage.local.remove(ACTIVE_PREVIEW_TARGET_KEY);
   render({ ...DEFAULT_SETTINGS }, null);
   showStatus("地址已清空；填写你的飞牛地址后再保存。", "warning");
 });
