@@ -624,13 +624,25 @@ export function matchesExpectedNavigation(
   return false;
 }
 
+export function generateNavigationId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  const timestamp = Date.now().toString(36);
+  const rand1 = Math.random().toString(36).slice(2, 10);
+  const rand2 = Math.random().toString(36).slice(2, 10);
+  return `nav_${timestamp}_${rand1}_${rand2}`;
+}
+
 export function parsePendingEnvelope(stored) {
   if (!stored || typeof stored !== "object") {
     return null;
   }
   if ("pending" in stored && stored.pending) {
     return {
+      navigationId: typeof stored.navigationId === "string" ? stored.navigationId : null,
       generation: Number.isInteger(Number(stored.generation)) ? Number(stored.generation) : null,
+      status: typeof stored.status === "string" ? stored.status : "active",
       pending: stored.pending,
       expectedUrl: typeof stored.expectedUrl === "string" ? stored.expectedUrl : null,
       expectedUrls: Array.isArray(stored.expectedUrls) ? stored.expectedUrls : [],
@@ -638,7 +650,9 @@ export function parsePendingEnvelope(stored) {
     };
   }
   return {
+    navigationId: null,
     generation: null,
+    status: "active",
     pending: stored,
     expectedUrl: null,
     expectedUrls: [],
@@ -661,42 +675,89 @@ export class NavigationPersistence {
     return null;
   }
 
-  pendingKey(tabId, generation) {
-    return `pending-recovery:${tabId}:${generation}`;
+  pendingKey(tabId, identity) {
+    return `pending-recovery:${tabId}:${identity}`;
   }
 
-  discoveryKey(ownerTabId, generation) {
-    return `lan-discovery:${ownerTabId}:${generation}`;
+  activeNavKey(tabId) {
+    return `nav-active:${tabId}`;
   }
 
-  async getPendingEnvelope(tabId, generation = null) {
+  discoveryKey(ownerTabId, identity) {
+    return `lan-discovery:${ownerTabId}:${identity}`;
+  }
+
+  async getActivePointer(tabId) {
     const s = this.storage;
     if (!s) {
       return null;
     }
-    if (generation !== null) {
-      const key = this.pendingKey(tabId, generation);
+    const key = this.activeNavKey(tabId);
+    const res = await s.get(key);
+    return res[key] ?? null;
+  }
+
+  async setActivePointer(tabId, navigationId) {
+    const s = this.storage;
+    if (!s || !navigationId) {
+      return false;
+    }
+    const key = this.activeNavKey(tabId);
+    await s.set({
+      [key]: {
+        navigationId,
+        status: "active",
+        updatedAt: Date.now()
+      }
+    });
+    return true;
+  }
+
+  async clearActivePointer(tabId, identity = null) {
+    const s = this.storage;
+    if (!s) {
+      return;
+    }
+    const key = this.activeNavKey(tabId);
+    if (identity !== null) {
+      const res = await s.get(key);
+      const active = res[key];
+      if (active && (active.navigationId === identity || active.generation === identity)) {
+        await s.remove(key);
+      }
+    } else {
+      await s.remove(key);
+    }
+  }
+
+  async getPendingEnvelope(tabId, identity = null) {
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
+    if (identity !== null) {
+      const key = this.pendingKey(tabId, identity);
       const res = await s.get(key);
       const stored = res[key];
       if (stored) {
-        return parsePendingEnvelope(stored);
-      }
-    } else {
-      // Find latest valid pending envelope for tab without shared pointer
-      const all = await s.get(null);
-      const prefix = `pending-recovery:${tabId}:`;
-      const candidates = [];
-      for (const [k, v] of Object.entries(all || {})) {
-        if (k.startsWith(prefix)) {
-          const parsed = parsePendingEnvelope(v);
-          if (parsed && parsed.pending) {
-            candidates.push(parsed);
-          }
+        const parsed = parsePendingEnvelope(stored);
+        if (parsed && parsed.status === "active") {
+          return parsed;
         }
       }
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0) || (b.generation || 0) - (a.generation || 0));
-        return candidates[0];
+    } else {
+      // Must have active pointer to prevent old completed/superseded pendings from resurrecting
+      const active = await this.getActivePointer(tabId);
+      if (active && active.navigationId && active.status === "active") {
+        const key = this.pendingKey(tabId, active.navigationId);
+        const res = await s.get(key);
+        const stored = res[key];
+        if (stored) {
+          const parsed = parsePendingEnvelope(stored);
+          if (parsed && parsed.status === "active") {
+            return parsed;
+          }
+        }
       }
     }
 
@@ -706,37 +767,59 @@ export class NavigationPersistence {
     const legacyStored = legacyRes[legacyKey];
     if (legacyStored) {
       const parsed = parsePendingEnvelope(legacyStored);
-      if (parsed && (generation === null || parsed.generation === generation)) {
+      if (parsed && (identity === null || parsed.navigationId === identity || parsed.generation === identity)) {
         return parsed;
       }
     }
     return null;
   }
 
-  async setPendingEnvelope(tabId, generation, envelope) {
+  async setPendingEnvelope(tabId, identity, envelope) {
     const s = this.storage;
-    if (!s || !Number.isInteger(generation)) {
+    if (!s || !identity) {
       return false;
     }
-    const key = this.pendingKey(tabId, generation);
+    const key = this.pendingKey(tabId, identity);
+    const activeKey = this.activeNavKey(tabId);
+    const navigationId = envelope.navigationId || (typeof identity === "string" ? identity : null);
+    const payload = {
+      ...envelope,
+      navigationId,
+      status: "active"
+    };
+
     await s.set({
-      [key]: envelope
+      [key]: payload,
+      [activeKey]: {
+        navigationId: navigationId || identity,
+        status: "active",
+        updatedAt: Date.now()
+      }
     });
     return true;
   }
 
-  async removePendingEnvelope(tabId, generation = null) {
+  async removePendingEnvelope(tabId, identity = null) {
     const s = this.storage;
     if (!s) {
       return;
     }
     const keysToRemove = [];
-    if (Number.isInteger(generation)) {
-      keysToRemove.push(this.pendingKey(tabId, generation));
+    if (identity !== null) {
+      keysToRemove.push(this.pendingKey(tabId, identity));
     }
     const legacyKey = `pending-recovery:${tabId}`;
     keysToRemove.push(legacyKey);
     await s.remove(keysToRemove);
+    await this.clearActivePointer(tabId, identity);
+  }
+
+  async supersedePending(tabId, oldIdentity) {
+    if (!oldIdentity) {
+      return;
+    }
+    await this.removePendingEnvelope(tabId, oldIdentity);
+    await this.removeDiscovery(tabId, oldIdentity);
   }
 
   async removeAllForTab(tabId) {
@@ -759,15 +842,24 @@ export class NavigationPersistence {
     }
   }
 
-  async getDiscovery(ownerTabId, generation = null) {
+  async getDiscovery(ownerTabId, identity = null) {
     const s = this.storage;
     if (!s) {
       return null;
     }
-    if (generation !== null) {
-      const key = this.discoveryKey(ownerTabId, generation);
+    if (identity !== null) {
+      const key = this.discoveryKey(ownerTabId, identity);
       const res = await s.get(key);
       return res[key] ?? null;
+    }
+    const active = await this.getActivePointer(ownerTabId);
+    if (active && active.navigationId) {
+      const key = this.discoveryKey(ownerTabId, active.navigationId);
+      const res = await s.get(key);
+      const found = res[key];
+      if (found && Number(found.expiresAt) > Date.now()) {
+        return found;
+      }
     }
     const all = await s.get(null);
     const prefix = `lan-discovery:${ownerTabId}:`;
@@ -783,29 +875,31 @@ export class NavigationPersistence {
     return latest;
   }
 
-  async setDiscovery(ownerTabId, generation, discovery) {
+  async setDiscovery(ownerTabId, identity, discovery) {
     const s = this.storage;
-    if (!s || !Number.isInteger(generation)) {
+    if (!s || !identity) {
       return false;
     }
-    const key = this.discoveryKey(ownerTabId, generation);
+    const key = this.discoveryKey(ownerTabId, identity);
+    const navigationId = typeof identity === "string" ? identity : null;
     await s.set({
       [key]: {
         ...discovery,
         ownerTabId,
-        generation
+        navigationId,
+        generation: Number.isInteger(identity) ? identity : discovery.generation
       }
     });
     return true;
   }
 
-  async removeDiscovery(ownerTabId, generation = null) {
+  async removeDiscovery(ownerTabId, identity = null) {
     const s = this.storage;
     if (!s) {
       return;
     }
-    if (generation !== null) {
-      const key = this.discoveryKey(ownerTabId, generation);
+    if (identity !== null) {
+      const key = this.discoveryKey(ownerTabId, identity);
       await s.remove(key);
       return;
     }
@@ -828,7 +922,7 @@ export class NavigationPersistence {
     return Object.entries(all || {})
       .filter(([key]) => key.startsWith("lan-discovery:"))
       .map(([, val]) => val)
-      .filter((val) => val && Number(val.expiresAt) > now && Number.isInteger(val.generation));
+      .filter((val) => val && Number(val.expiresAt) > now);
   }
 }
 
@@ -838,37 +932,43 @@ export class TabNavigationManager {
     this.latestGenerations = new Map();
   }
 
-  begin(tabId) {
+  begin(tabId, explicitId = null) {
     const previous = this.states.get(tabId);
-    if (previous?.abortController) {
-      try {
-        previous.abortController.abort();
-      } catch {
-        // Ignore
+    if (previous) {
+      previous.cancelled = true;
+      previous.status = "superseded";
+      if (previous.abortController) {
+        try {
+          previous.abortController.abort();
+        } catch {
+          // Ignore
+        }
       }
     }
     const lastGen = this.latestGenerations.get(tabId) ?? (previous?.generation ?? 0);
     const generation = lastGen + 1;
     this.latestGenerations.set(tabId, generation);
+    const navigationId = explicitId || generateNavigationId();
     const abortController = new AbortController();
     const state = {
       tabId,
+      navigationId,
       generation,
+      status: "active",
       expectedUrl: null,
       expectedUrls: new Set(),
       pending: null,
       abortController,
       cancelled: false,
+      closing: false,
       startedAt: Date.now()
     };
     this.states.set(tabId, state);
     return generation;
   }
 
-  rehydrate(tabId, { generation, expectedUrl = null, expectedUrls = [], pending = null } = {}) {
-    if (!Number.isInteger(generation) || generation <= 0) {
-      return null;
-    }
+  rehydrate(tabId, { navigationId = null, generation = null, expectedUrl = null, expectedUrls = [], pending = null } = {}) {
+    const navId = navigationId || (generation ? `gen_${generation}` : generateNavigationId());
     const previous = this.states.get(tabId);
     if (previous?.abortController) {
       try {
@@ -877,8 +977,9 @@ export class TabNavigationManager {
         // Ignore
       }
     }
+    const gen = Number.isInteger(generation) ? generation : (this.latestGenerations.get(tabId) ?? 0) + 1;
     const lastGen = this.latestGenerations.get(tabId) ?? 0;
-    this.latestGenerations.set(tabId, Math.max(lastGen, generation));
+    this.latestGenerations.set(tabId, Math.max(lastGen, gen));
 
     let normalizedExpected = null;
     if (expectedUrl) {
@@ -904,12 +1005,15 @@ export class TabNavigationManager {
     const abortController = new AbortController();
     const state = {
       tabId,
-      generation,
+      navigationId: navId,
+      generation: gen,
+      status: "active",
       expectedUrl: normalizedExpected,
       expectedUrls: normalizedSet,
       pending,
       abortController,
       cancelled: false,
+      closing: false,
       startedAt: Date.now()
     };
     this.states.set(tabId, state);
@@ -920,6 +1024,10 @@ export class TabNavigationManager {
     return this.states.get(tabId) ?? null;
   }
 
+  getNavigationId(tabId) {
+    return this.states.get(tabId)?.navigationId ?? null;
+  }
+
   getGeneration(tabId) {
     return this.states.get(tabId)?.generation ?? null;
   }
@@ -928,71 +1036,71 @@ export class TabNavigationManager {
     return this.latestGenerations.get(tabId) ?? null;
   }
 
-  getAbortSignal(tabId, generation = null) {
+  getAbortSignal(tabId, identity = null) {
     const state = this.states.get(tabId);
     if (!state || state.cancelled) {
       return null;
     }
-    if (generation !== null && state.generation !== generation) {
+    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
       return null;
     }
     return state.abortController?.signal ?? null;
   }
 
-  isActive(tabId, generation = null) {
+  isActive(tabId, identity = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || state.closing) {
+    if (!state || state.cancelled || state.closing || state.status !== "active") {
       return false;
     }
-    if (generation !== null && state.generation !== generation) {
+    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
       return false;
     }
     return true;
   }
 
-  claimTabForRemoval(tabId, generation) {
+  claimTabForRemoval(tabId, identity) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || state.closing) {
+    if (!state || state.cancelled || state.closing || state.status !== "active") {
       return null;
     }
-    if (generation !== null && state.generation !== generation) {
+    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
       return null;
     }
     state.closing = true;
     return state;
   }
 
-  isClaimedForRemoval(tabId, generation) {
+  isClaimedForRemoval(tabId, identity) {
     const state = this.states.get(tabId);
     if (!state || state.cancelled || !state.closing) {
       return false;
     }
-    if (generation !== null && state.generation !== generation) {
+    if (identity !== null && state.navigationId !== identity && state.generation !== identity) {
       return false;
     }
     return true;
   }
 
-  setPending(tabId, pending, generation = null) {
+  setPending(tabId, pending, identity = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
       return false;
     }
     state.pending = pending;
     return true;
   }
 
-  getPending(tabId, generation = null) {
+  getPending(tabId, identity = null) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+    if (!state || state.cancelled || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
       return null;
     }
     return state.pending ?? null;
   }
 
-  setExpectedUrl(tabId, generation, url) {
+  setExpectedUrl(tabId, identity, url) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
       return false;
     }
     try {
@@ -1005,9 +1113,9 @@ export class TabNavigationManager {
     }
   }
 
-  addExpectedUrl(tabId, generation, url) {
+  addExpectedUrl(tabId, identity, url) {
     const state = this.states.get(tabId);
-    if (!state || state.cancelled || (generation !== null && state.generation !== generation)) {
+    if (!state || state.cancelled || state.closing || (identity !== null && state.navigationId !== identity && state.generation !== identity)) {
       return false;
     }
     try {
@@ -1022,32 +1130,33 @@ export class TabNavigationManager {
   handleUrlChange(tabId, newUrl, fallbackPending = null) {
     const state = this.states.get(tabId);
     if (!state || state.cancelled) {
-      return { active: false, matched: false, cancelled: false, generation: state?.generation ?? null };
+      return { active: false, matched: false, cancelled: false, generation: state?.generation ?? null, navigationId: state?.navigationId ?? null };
     }
 
     if (isIgnoredNavigationUrl(newUrl)) {
-      return { active: true, matched: true, cancelled: false, generation: state.generation };
+      return { active: true, matched: true, cancelled: false, generation: state.generation, navigationId: state.navigationId };
     }
 
     const pending = state.pending ?? fallbackPending;
     if (matchesExpectedNavigation(state.expectedUrls, pending, newUrl, state.expectedUrl)) {
-      this.addExpectedUrl(tabId, state.generation, newUrl);
-      return { active: true, matched: true, cancelled: false, generation: state.generation };
+      this.addExpectedUrl(tabId, state.navigationId, newUrl);
+      return { active: true, matched: true, cancelled: false, generation: state.generation, navigationId: state.navigationId };
     }
 
-    this.cancel(tabId, "url-mismatch", state.generation);
-    return { active: false, matched: false, cancelled: true, generation: state.generation };
+    this.cancel(tabId, "url-mismatch", state.navigationId);
+    return { active: false, matched: false, cancelled: true, generation: state.generation, navigationId: state.navigationId };
   }
 
-  cancel(tabId, reason = "cancelled", targetGeneration = null) {
+  cancel(tabId, reason = "cancelled", targetIdentity = null) {
     const state = this.states.get(tabId);
     if (!state) {
       return null;
     }
-    if (targetGeneration !== null && state.generation !== targetGeneration) {
+    if (targetIdentity !== null && state.navigationId !== targetIdentity && state.generation !== targetIdentity) {
       return null;
     }
     state.cancelled = true;
+    state.status = "cancelled";
     if (state.abortController) {
       try {
         state.abortController.abort();
@@ -1085,16 +1194,18 @@ export class OwnedTabController {
     return null;
   }
 
-  async removeOwnedTab(tabId, generation, reason = "close-owned-tab") {
-    if (!Number.isInteger(tabId) || !Number.isInteger(generation)) {
+  async removeOwnedTab(tabId, identity, reason = "close-owned-tab") {
+    if (!Number.isInteger(tabId) || !identity) {
       return { ok: false, reason: "invalid-params" };
     }
 
-    const claimedState = this.tabNavigations.claimTabForRemoval(tabId, generation);
+    // Step 1: Claim tab for removal atomically in memory
+    const claimedState = this.tabNavigations.claimTabForRemoval(tabId, identity);
     if (!claimedState) {
       return { ok: false, reason: "stale-generation" };
     }
 
+    // Step 2: Fetch tab information
     let currentTab;
     try {
       if (!this.tabs?.get) {
@@ -1102,39 +1213,48 @@ export class OwnedTabController {
       }
       currentTab = await this.tabs.get(tabId);
     } catch {
-      this.tabNavigations.cancel(tabId, reason, generation);
+      this.tabNavigations.cancel(tabId, reason, identity);
       if (this.persistence) {
-        await this.persistence.removePendingEnvelope(tabId, generation);
-        await this.persistence.removeDiscovery(tabId, generation);
+        await this.persistence.removePendingEnvelope(tabId, identity);
+        await this.persistence.removeDiscovery(tabId, identity);
       }
       return { ok: false, reason: "tab-not-found" };
     }
 
-    if (!this.tabNavigations.isClaimedForRemoval(tabId, generation)) {
+    // Step 3: Re-verify claim post-tabs.get await
+    if (!this.tabNavigations.isClaimedForRemoval(tabId, identity)) {
       return { ok: false, reason: "stale-generation" };
     }
 
+    // Step 4: Verify URL sanity
     if (typeof currentTab?.url === "string") {
       const allowedUrls = claimedState.expectedUrls || new Set();
       const isAllowed = isIgnoredNavigationUrl(currentTab.url)
         || matchesExpectedNavigation(allowedUrls, claimedState.pending, currentTab.url, claimedState.expectedUrl);
 
       if (!isAllowed) {
-        this.tabNavigations.cancel(tabId, "user-navigated-away", generation);
+        this.tabNavigations.cancel(tabId, "user-navigated-away", identity);
         if (this.persistence) {
-          await this.persistence.removePendingEnvelope(tabId, generation);
-          await this.persistence.removeDiscovery(tabId, generation);
+          await this.persistence.removePendingEnvelope(tabId, identity);
+          await this.persistence.removeDiscovery(tabId, identity);
         }
         return { ok: false, reason: "user-navigated-away" };
       }
     }
 
-    this.tabNavigations.cancel(tabId, reason, generation);
+    // Step 5: Clean up persistence while STILL holding the closing claim!
     if (this.persistence) {
-      await this.persistence.removePendingEnvelope(tabId, generation);
-      await this.persistence.removeDiscovery(tabId, generation);
+      await this.persistence.removePendingEnvelope(tabId, identity);
+      await this.persistence.removeDiscovery(tabId, identity);
     }
 
+    // Step 6: CRITICAL PRE-REMOVE SYNCHRONOUS CHECK (ZERO await between check and tabs.remove)
+    if (!this.tabNavigations.isClaimedForRemoval(tabId, identity)) {
+      return { ok: false, reason: "stale-generation" };
+    }
+
+    // Step 7: Consume ownership and remove tab
+    this.tabNavigations.cancel(tabId, reason, identity);
     try {
       if (!this.tabs?.remove) {
         throw new Error("tabs.remove unavailable");
@@ -1163,42 +1283,76 @@ export class LanRouteStore {
     return null;
   }
 
+  routeKey(targetUrl) {
+    return `device-lan-route:${normalizeNavigableUrl(targetUrl)}`;
+  }
+
   async loadRoutes() {
     const s = this.storage;
     if (!s) {
       return {};
     }
-    const stored = await s.get("device-lan-routes");
-    const routes = stored?.["device-lan-routes"];
-    return routes && typeof routes === "object" ? routes : {};
+    const all = await s.get(null);
+    const routes = {};
+
+    // Load individual route keys
+    for (const [k, v] of Object.entries(all || {})) {
+      if (k.startsWith("device-lan-route:") && v && typeof v === "object") {
+        const url = k.slice("device-lan-route:".length);
+        routes[url] = v;
+      }
+    }
+
+    // Migrate/merge legacy device-lan-routes if present
+    const legacy = all?.["device-lan-routes"];
+    if (legacy && typeof legacy === "object") {
+      for (const [k, v] of Object.entries(legacy)) {
+        if (!routes[k]) {
+          routes[k] = v;
+        }
+      }
+    }
+
+    return routes;
   }
 
   async getRoute(targetUrl) {
     if (!targetUrl) {
       return null;
     }
-    const routes = await this.loadRoutes();
+    const s = this.storage;
+    if (!s) {
+      return null;
+    }
     const key = normalizeNavigableUrl(targetUrl);
-    return routes[key] ?? null;
+    const singleKey = this.routeKey(key);
+    const res = await s.get(singleKey);
+    if (res[singleKey] && typeof res[singleKey] === "object") {
+      return res[singleKey];
+    }
+    // Fallback check
+    const allRoutes = await this.loadRoutes();
+    return allRoutes[key] ?? null;
   }
 
-  async saveRoute(remoteTargetUrl, route, ownerTabId = null, generation = null) {
+  async saveRoute(remoteTargetUrl, route, ownerTabId = null, identity = null) {
     const s = this.storage;
     if (!s) {
       return null;
     }
 
-    if (ownerTabId !== null && generation !== null && this.tabNavigations) {
-      if (!this.tabNavigations.isActive(ownerTabId, generation)) {
+    if (ownerTabId !== null && identity !== null && this.tabNavigations) {
+      if (!this.tabNavigations.isActive(ownerTabId, identity)) {
         return null;
       }
     }
 
     const key = normalizeNavigableUrl(remoteTargetUrl);
-    const existingRoutes = await this.loadRoutes();
+    const singleKey = this.routeKey(key);
+    const existing = await s.get(singleKey);
 
-    if (ownerTabId !== null && generation !== null && this.tabNavigations) {
-      if (!this.tabNavigations.isActive(ownerTabId, generation)) {
+    if (ownerTabId !== null && identity !== null && this.tabNavigations) {
+      if (!this.tabNavigations.isActive(ownerTabId, identity)) {
         return null;
       }
     }
@@ -1206,11 +1360,11 @@ export class LanRouteStore {
     const updatedRoute = {
       ...route,
       remoteTargetUrl: key,
+      navigationId: identity,
       learnedAt: Date.now()
     };
-    existingRoutes[key] = updatedRoute;
 
-    await s.set({ ["device-lan-routes"]: existingRoutes });
+    await s.set({ [singleKey]: updatedRoute });
 
     if (typeof chrome !== "undefined" && chrome?.storage?.session) {
       try {
@@ -1229,8 +1383,6 @@ export class LanRouteStore {
       return;
     }
     const key = normalizeNavigableUrl(remoteTargetUrl);
-    const existingRoutes = await this.loadRoutes();
-    delete existingRoutes[key];
-    await s.set({ ["device-lan-routes"]: existingRoutes });
+    await s.remove(this.routeKey(key));
   }
 }

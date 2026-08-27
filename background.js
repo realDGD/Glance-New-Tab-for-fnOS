@@ -910,7 +910,10 @@ async function beginNativeLanRecovery(tabId, pending, explicitGeneration = null)
     targetUrl: pending.lanTargetUrl,
     healthUrl: pending.lanHealthUrl,
     rootUrl: pending.lanRootUrl
-  });
+  }, tabId, generation);
+  if (!route || !tabNavigations.isActive(tabId, generation)) {
+    return { action: "ignored" };
+  }
   const updated = {
     ...pending,
     phase: "lan-root",
@@ -949,7 +952,10 @@ async function startPermittedLanSetup(tabId) {
       targetUrl: pending.lanTargetUrl,
       healthUrl: pending.lanHealthUrl,
       rootUrl: pending.lanRootUrl
-    });
+    }, tabId, generation);
+    if (!route || !tabNavigations.isActive(tabId, generation)) {
+      return { action: "ignored" };
+    }
     const signal = tabNavigations.getAbortSignal(tabId, generation);
     if ((await probeLanHealth(route, { signal })).ok) {
       if (!tabNavigations.isActive(tabId, generation)) {
@@ -1059,15 +1065,17 @@ async function handlePrivateLanNavigation(tabId, tabUrl) {
         targetUrl: setupPending.lanTargetUrl,
         healthUrl: setupPending.lanHealthUrl,
         rootUrl: lanRootUrl
-      });
-      const signal = tabNavigations.getAbortSignal(tabId, generation);
-      if ((await probeLanHealth(route, { signal })).ok) {
-        if (tabNavigations.isActive(tabId, generation)) {
-          await removePending(tabId, generation);
-          await navigateOwnedTab(tabId, generation, route.targetUrl);
+      }, tabId, generation);
+      if (route) {
+        const signal = tabNavigations.getAbortSignal(tabId, generation);
+        if ((await probeLanHealth(route, { signal })).ok) {
+          if (tabNavigations.isActive(tabId, generation)) {
+            await removePending(tabId, generation);
+            await navigateOwnedTab(tabId, generation, route.targetUrl);
+            return true;
+          }
           return true;
         }
-        return true;
       }
     }
     if (tabNavigations.isActive(tabId, generation)) {
