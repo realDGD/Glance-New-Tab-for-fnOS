@@ -45,6 +45,51 @@ const LAN_DISCOVERY_TIMEOUT_MS = 2 * 60 * 1000;
 const LAN_PROBE_TIMEOUT_MS = 1800;
 let sessionClaimQueue = Promise.resolve();
 const tabTransitionQueues = new Map();
+
+function serializeSessionClaim(task) {
+  const result = sessionClaimQueue.then(task, task);
+  sessionClaimQueue = result.catch(() => undefined);
+  return result;
+}
+
+function serializeTabTransition(tabId, task) {
+  const previous = tabTransitionQueues.get(tabId) ?? Promise.resolve();
+  const current = previous.then(task, task);
+  const queued = current.catch(() => undefined);
+  tabTransitionQueues.set(tabId, queued);
+  void current.finally(() => {
+    if (tabTransitionQueues.get(tabId) === queued) {
+      tabTransitionQueues.delete(tabId);
+    }
+  }).catch(() => undefined);
+  return current;
+}
+
+async function isSessionWarmed() {
+  try {
+    const stored = await chrome.storage.session.get(SESSION_WARM_KEY);
+    return Boolean(stored[SESSION_WARM_KEY]);
+  } catch {
+    return false;
+  }
+}
+
+async function markSessionWarmed() {
+  return serializeSessionClaim(async () => {
+    try {
+      await chrome.storage.session.set({
+        [SESSION_WARM_KEY]: {
+          warmedAt: Date.now()
+        }
+      });
+      return true;
+    } catch (error) {
+      console.error("Failed to mark session warmed:", error);
+      return false;
+    }
+  });
+}
+
 const tabNavigations = new TabNavigationManager();
 const navPersistence = new NavigationPersistence();
 const lanRouteStore = new LanRouteStore(tabNavigations);
@@ -315,39 +360,7 @@ async function removeOwnedTab(tabId, identity, reason = "close-owned-tab") {
   return ownedTabController.removeOwnedTab(tabId, identity, reason);
 }
 
-function serializeSessionClaim(task) {
-  const result = sessionClaimQueue.then(task, task);
-  sessionClaimQueue = result.catch(() => undefined);
-  return result;
-}
 
-function serializeTabTransition(tabId, task) {
-  const previous = tabTransitionQueues.get(tabId) ?? Promise.resolve();
-  const current = previous.then(task, task);
-  const queued = current.catch(() => undefined);
-  tabTransitionQueues.set(tabId, queued);
-  void current.finally(() => {
-    if (tabTransitionQueues.get(tabId) === queued) {
-      tabTransitionQueues.delete(tabId);
-    }
-  }).catch(() => undefined);
-  return current;
-}
-
-async function markSessionAndCheckIfWarm() {
-  return serializeSessionClaim(async () => {
-    const stored = await chrome.storage.session.get(SESSION_WARM_KEY);
-    const sessionWarmed = Boolean(stored[SESSION_WARM_KEY]);
-    if (!sessionWarmed) {
-      await chrome.storage.session.set({
-        [SESSION_WARM_KEY]: {
-          warmedAt: Date.now()
-        }
-      });
-    }
-    return sessionWarmed;
-  });
-}
 
 async function probeAuth(checkUrl, { signal = null } = {}) {
   const remoteFnOsUrl = isFnOsUrl(checkUrl);
@@ -539,7 +552,7 @@ async function fallbackFromUnreachableLan(tabId, navigationId, settings) {
     return;
   }
 
-  const sessionWarmed = await markSessionAndCheckIfWarm();
+  const sessionWarmed = await isSessionWarmed();
   if (!tabNavigations.isActive(tabId, navigationId)) {
     return;
   }
@@ -683,7 +696,6 @@ async function openConfiguredPage(tabId, source = "new-tab", explicitNavigationI
     return { action: "cancelled", themeMode: settings.themeMode };
   }
 
-  await markSessionWarmed();
   await beginRecovery(tabId, settings, `${source}-cold-start`, navigationId);
   return { action: "recovering-startup", themeMode: settings.themeMode };
 }
@@ -716,7 +728,6 @@ async function continueAfterWarmup({ tabId, navigationId, settings, source }) {
       return;
     }
 
-    await markSessionWarmed();
     await beginRecovery(tabId, settings, `${source}-warmup-failed-takeover`, navigationId);
   } catch (error) {
     console.error(`[FNOS prewarm] Error in continueAfterWarmup for tab ${tabId}:`, error);
@@ -1671,6 +1682,7 @@ async function handleMessage(message, sender) {
       ) {
         return { action: "ignored" };
       }
+      await markSessionWarmed();
       const helperTabId = Number(pending.helperTabId);
       await cancelNavigation(senderTabId, "target-ready", navContext?.navigationId);
       if (Number.isInteger(helperTabId)) {

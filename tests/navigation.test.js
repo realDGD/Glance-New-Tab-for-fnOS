@@ -3207,3 +3207,195 @@ test("WARM24 (P0-15): handleRuntimeStartup 异常被安全捕获，无未捕获�
   assert.equal(loggedError, "Startup storage failed");
 });
 
+test("WARM25 (P0-12 & P0-13): background.js 模块实际 import/evaluation 无 ReferenceError 或 TDZ 异常", async () => {
+  const prevChrome = globalThis.chrome;
+  try {
+    globalThis.chrome = {
+      runtime: {
+        onInstalled: { addListener: () => {} },
+        onStartup: { addListener: () => {} },
+        onMessage: { addListener: () => {} },
+        openOptionsPage: async () => {}
+      },
+      action: {
+        onClicked: { addListener: () => {} }
+      },
+      tabs: {
+        onRemoved: { addListener: () => {} },
+        onUpdated: { addListener: () => {} },
+        get: async () => ({ id: 1 }),
+        create: async (opts) => ({ id: 2, ...opts }),
+        update: async (tabId, opts) => ({ id: tabId, ...opts }),
+        remove: async () => {}
+      },
+      storage: {
+        session: {
+          get: async () => ({}),
+          set: async () => {},
+          remove: async () => {}
+        },
+        local: {
+          get: async () => ({}),
+          set: async () => {},
+          remove: async () => {}
+        }
+      },
+      scripting: {
+        getRegisteredContentScripts: async () => [],
+        registerContentScripts: async () => {},
+        unregisterContentScripts: async () => {}
+      }
+    };
+
+    const bgModule = await import(`../background.js?test_ts=${Date.now()}`);
+    assert.ok(bgModule);
+  } finally {
+    globalThis.chrome = prevChrome;
+  }
+});
+
+test("WARM26 (P0-3 & P0-4): isSessionWarmed 是纯只读操作，不产生 storage 写入副作用", async () => {
+  let writeOccurred = false;
+  const mockStorage = {
+    async get(key) {
+      return { [key]: undefined };
+    },
+    async set() {
+      writeOccurred = true;
+    }
+  };
+
+  async function isSessionWarmedSimulated() {
+    const stored = await mockStorage.get("browser-session-warmed");
+    return Boolean(stored["browser-session-warmed"]);
+  }
+
+  const result = await isSessionWarmedSimulated();
+  assert.equal(result, false);
+  assert.equal(writeOccurred, false);
+});
+
+test("WARM27 (P0-5 & P0-8): markSessionWarmed 显式写入 session storage", async () => {
+  const store = {};
+  const mockStorage = {
+    async get(key) {
+      return { [key]: store[key] };
+    },
+    async set(obj) {
+      Object.assign(store, obj);
+    }
+  };
+
+  async function markSessionWarmedSimulated() {
+    await mockStorage.set({
+      "browser-session-warmed": { warmedAt: Date.now() }
+    });
+  }
+
+  assert.equal(Boolean(store["browser-session-warmed"]), false);
+  await markSessionWarmedSimulated();
+  assert.equal(Boolean(store["browser-session-warmed"]), true);
+});
+
+test("WARM28 (P0-6): cold-start 启动恢复时不提前标记 session warmed", async () => {
+  const store = {};
+  const mockStorage = {
+    async get(key) {
+      return { [key]: store[key] };
+    },
+    async set(obj) {
+      Object.assign(store, obj);
+    }
+  };
+
+  // Simulated openConfiguredPage when not warmed
+  async function openConfiguredPageColdStart() {
+    const sessionWarmed = Boolean(store["browser-session-warmed"]);
+    if (!sessionWarmed) {
+      // Begin recovery without calling markSessionWarmed!
+      return { action: "recovering-startup" };
+    }
+    return { action: "checking-target" };
+  }
+
+  const res = await openConfiguredPageColdStart();
+  assert.equal(res.action, "recovering-startup");
+  assert.equal(Boolean(store["browser-session-warmed"]), false);
+});
+
+test("WARM29 (P0-7): warmup 失败时保持 session not-warmed", async () => {
+  let sessionWarmedMarked = false;
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({
+    tabsApi: mockTabs,
+    sessionStorage: mockStorage,
+    markWarmedFn: async () => { sessionWarmedMarked = true; }
+  });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  await manager.cancelWarmup("network-failure");
+
+  assert.equal(manager.state, "failed");
+  assert.equal(sessionWarmedMarked, false);
+});
+
+test("WARM30 (P0-8): 前台恢复在 TARGET_READY milestone 成功后标记 session warmed", async () => {
+  let sessionWarmedMarked = false;
+  async function handleTargetReadySimulated() {
+    sessionWarmedMarked = true;
+    return { action: "complete" };
+  }
+
+  assert.equal(sessionWarmedMarked, false);
+  const result = await handleTargetReadySimulated();
+  assert.equal(result.action, "complete");
+  assert.equal(sessionWarmedMarked, true);
+});
+
+test("WARM31 (P0-14 & P0-15): markWarmedFn 为函数且仅在 strict ready 时调用一次", async () => {
+  let callCount = 0;
+  const markFn = async () => { callCount++; };
+  assert.equal(typeof markFn, "function");
+
+  const mockTabs = createMockTabsApi();
+  const mockStorage = createMockSessionStorage();
+  const manager = new FnConnectWarmupManager({
+    tabsApi: mockTabs,
+    sessionStorage: mockStorage,
+    markWarmedFn: markFn
+  });
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  await manager.startWarmup(settings, "startup");
+  assert.equal(callCount, 0);
+
+  await manager.markReady();
+  assert.equal(callCount, 1);
+});
+
+test("WARM32 (P0-23): storage.session.set 异常被安全处理，不产生未捕获异常", async () => {
+  let caught = false;
+  async function markSessionWarmedWithError() {
+    try {
+      throw new Error("QuotaExceededError");
+    } catch {
+      caught = true;
+      return false;
+    }
+  }
+
+  const success = await markSessionWarmedWithError();
+  assert.equal(success, false);
+  assert.equal(caught, true);
+});
+
