@@ -691,7 +691,6 @@
         window.requestAnimationFrame(resolve);
       }));
       await fadeOutLoadingOverlay();
-      schedulePreviewRefresh(pending.targetUrl);
       return;
     }
 

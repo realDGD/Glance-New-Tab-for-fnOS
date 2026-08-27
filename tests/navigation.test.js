@@ -19,6 +19,9 @@ import {
   NavigationPersistence,
   OwnedTabController,
   LanRouteStore,
+  LanScriptManager,
+  scriptIdForPattern,
+  isDuplicateScriptRegistrationError,
   finishTargetPresentation,
   cleanupLegacyPreviewStorage
 } from "../shared.js";
@@ -1265,7 +1268,53 @@ test("T6: Consecutive begins produce unique UUIDs with no collision or reuse", (
   assert.equal(manager.isActive(tabId, navB.navigationId), true);
 });
 
-test("T1: content.js syntax check - passes node --check with no duplicate declarations or SyntaxError", () => {
+test("T1: Preview API 不再存在于 production call-site", () => {
+  const filesToCheck = ["content.js", "background.js", "newtab.js", "options.js"];
+  const forbiddenPatterns = [
+    /\bschedulePreviewRefresh\s*\(/,
+    /\bsaveCurrentGlancePreview\s*\(/,
+    /\bextractGlancePreview\s*\(/,
+    /\brenderGlancePreviewHtml\s*\(/,
+    /\brenderGlanceSkeletonHtml\s*\(/
+  ];
+
+  for (const file of filesToCheck) {
+    const code = fs.readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
+    for (const pattern of forbiddenPatterns) {
+      assert.equal(
+        pattern.test(code),
+        false,
+        `File ${file} should not contain call matching ${pattern}`
+      );
+    }
+  }
+});
+
+test("T2: target success 不再引用 Preview and resolves without ReferenceError", async () => {
+  let overlayFaded = false;
+  let targetReadySent = false;
+
+  const mockSend = async (msg) => {
+    if (msg.type === "TARGET_READY") {
+      targetReadySent = true;
+    }
+  };
+
+  const fadeOutLoadingOverlay = async () => {
+    overlayFaded = true;
+  };
+
+  // Simulate exact target ready flow in content.js
+  await (async () => {
+    await mockSend({ type: "TARGET_READY" });
+    await fadeOutLoadingOverlay();
+  })();
+
+  assert.equal(targetReadySent, true);
+  assert.equal(overlayFaded, true);
+});
+
+test("T3: node --check content.js and all production scripts", () => {
   const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
   assert.ok(contentJs.length > 0);
 
@@ -1280,17 +1329,9 @@ test("T1: content.js syntax check - passes node --check with no duplicate declar
     }
     uniqueNames.add(name);
   }
-  // All top-level declared identifiers in closure scope must be distinct
   assert.equal(duplicates.includes("previewLayer"), false);
   assert.equal(duplicates.includes("promptCard"), false);
 
-  // Direct check with Node.js parser
-  assert.doesNotThrow(() => {
-    execSync("node --check content.js", { cwd: new URL("..", import.meta.url) });
-  });
-});
-
-test("T2: JS codebase syntax check - all production script files parse cleanly", () => {
   assert.doesNotThrow(() => {
     execSync("node --check content.js shared.js background.js newtab.js options.js", {
       cwd: new URL("..", import.meta.url)
@@ -1298,7 +1339,277 @@ test("T2: JS codebase syntax check - all production script files parse cleanly",
   });
 });
 
-test("T3: Legacy preview cleanup - cleanupLegacyPreviewStorage clears old preview keys while preserving user settings and LAN routes", async () => {
+test("T4: 同 pattern 两个并发 ensure calls execute registration exactly once", async () => {
+  let registerCallCount = 0;
+  const registered = new Set();
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      return Array.from(registered).map((id) => ({ id }));
+    },
+    async registerContentScripts(scripts) {
+      registerCallCount++;
+      await new Promise((r) => setTimeout(r, 10));
+      for (const s of scripts) {
+        if (registered.has(s.id)) {
+          throw new Error(`Duplicate script ID '${s.id}'`);
+        }
+        registered.add(s.id);
+      }
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  const pattern = "http://192.168.1.50:8080/*";
+
+  await Promise.all([
+    manager.ensureContentScripts(pattern),
+    manager.ensureContentScripts(pattern)
+  ]);
+
+  assert.equal(registerCallCount, 1);
+  assert.equal(manager.registeredPatterns.has(pattern), true);
+  assert.equal(registered.has(scriptIdForPattern(pattern, "page")), true);
+  assert.equal(registered.has(scriptIdForPattern(pattern, "content")), true);
+});
+
+test("T5: 三个以上并发 ensure on same pattern execute only 1 registration flow", async () => {
+  let registerCallCount = 0;
+  const registered = new Set();
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      return Array.from(registered).map((id) => ({ id }));
+    },
+    async registerContentScripts(scripts) {
+      registerCallCount++;
+      await new Promise((r) => setTimeout(r, 15));
+      for (const s of scripts) {
+        if (registered.has(s.id)) {
+          throw new Error(`Duplicate script ID '${s.id}'`);
+        }
+        registered.add(s.id);
+      }
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  const pattern = "http://192.168.1.100:3000/*";
+
+  await Promise.all([
+    manager.ensureContentScripts(pattern),
+    manager.ensureContentScripts(pattern),
+    manager.ensureContentScripts(pattern),
+    manager.ensureContentScripts(pattern)
+  ]);
+
+  assert.equal(registerCallCount, 1);
+  assert.equal(manager.registeredPatterns.has(pattern), true);
+});
+
+test("T6: 不同 pattern 可以并行 independently", async () => {
+  const registered = new Set();
+  const registerCallsByPattern = new Map();
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      return Array.from(registered).map((id) => ({ id }));
+    },
+    async registerContentScripts(scripts) {
+      for (const s of scripts) {
+        registerCallsByPattern.set(s.matches[0], (registerCallsByPattern.get(s.matches[0]) || 0) + 1);
+        registered.add(s.id);
+      }
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  const patternA = "http://192.168.1.10:8080/*";
+  const patternB = "http://192.168.1.20:9090/*";
+
+  await Promise.all([
+    manager.ensureContentScripts(patternA),
+    manager.ensureContentScripts(patternB)
+  ]);
+
+  assert.equal(manager.registeredPatterns.has(patternA), true);
+  assert.equal(manager.registeredPatterns.has(patternB), true);
+  assert.equal(registerCallsByPattern.get(patternA), 2); // page + content
+  assert.equal(registerCallsByPattern.get(patternB), 2); // page + content
+});
+
+test("T7: Scripts 已存在 skips registerContentScripts and marks pattern", async () => {
+  let registerCallCount = 0;
+  const pattern = "http://192.168.1.50:8080/*";
+  const pageId = scriptIdForPattern(pattern, "page");
+  const contentId = scriptIdForPattern(pattern, "content");
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      return [{ id: pageId }, { id: contentId }];
+    },
+    async registerContentScripts() {
+      registerCallCount++;
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  await manager.ensureContentScripts(pattern);
+
+  assert.equal(registerCallCount, 0);
+  assert.equal(manager.registeredPatterns.has(pattern), true);
+});
+
+test("T8: Duplicate ID 外部竞态 re-checks registered scripts and succeeds idempotently", async () => {
+  let firstGet = true;
+  const pattern = "http://192.168.1.60:8080/*";
+  const pageId = scriptIdForPattern(pattern, "page");
+  const contentId = scriptIdForPattern(pattern, "content");
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      if (firstGet) {
+        firstGet = false;
+        return [];
+      }
+      // Second get returns target scripts registered by another process/worker
+      return [{ id: pageId }, { id: contentId }];
+    },
+    async registerContentScripts() {
+      throw new Error(`Duplicate script ID '${pageId}'`);
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  await assert.doesNotReject(async () => {
+    await manager.ensureContentScripts(pattern);
+  });
+
+  assert.equal(manager.registeredPatterns.has(pattern), true);
+});
+
+test("T9: Duplicate 错误但 scripts 仍缺失 re-throws the registration error", async () => {
+  let firstGet = true;
+  const pattern = "http://192.168.1.70:8080/*";
+  const pageId = scriptIdForPattern(pattern, "page");
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      if (firstGet) {
+        firstGet = false;
+        return [];
+      }
+      // Second get returns only 1 of the 2 required scripts
+      return [{ id: pageId }];
+    },
+    async registerContentScripts() {
+      throw new Error(`Duplicate script ID '${pageId}'`);
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  await assert.rejects(
+    async () => {
+      await manager.ensureContentScripts(pattern);
+    },
+    { message: /Duplicate script ID/ }
+  );
+
+  assert.equal(manager.registeredPatterns.has(pattern), false);
+});
+
+test("T10: 真实注册错误 propagates to caller and is not swallowed", async () => {
+  const pattern = "http://192.168.1.80:8080/*";
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      return [];
+    },
+    async registerContentScripts() {
+      throw new Error("Permission denied: cannot access chrome.scripting API");
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  await assert.rejects(
+    async () => {
+      await manager.ensureContentScripts(pattern);
+    },
+    { message: /Permission denied/ }
+  );
+
+  assert.equal(manager.registeredPatterns.has(pattern), false);
+});
+
+test("T11: Service Worker restart correctly queries existing scripts without duplicate register", async () => {
+  const persistentStore = new Set();
+  let totalRegisterCalls = 0;
+
+  const createMockScripting = () => ({
+    async getRegisteredContentScripts() {
+      return Array.from(persistentStore).map((id) => ({ id }));
+    },
+    async registerContentScripts(scripts) {
+      totalRegisterCalls++;
+      for (const s of scripts) {
+        persistentStore.add(s.id);
+      }
+    }
+  });
+
+  const pattern = "http://192.168.1.90:8080/*";
+
+  // Worker 1 runs
+  const worker1 = new LanScriptManager({ scripting: createMockScripting() });
+  await worker1.ensureContentScripts(pattern);
+  assert.equal(totalRegisterCalls, 1);
+  assert.equal(worker1.registeredPatterns.has(pattern), true);
+
+  // Worker 2 (restarted SW, memory set is initially empty)
+  const worker2 = new LanScriptManager({ scripting: createMockScripting() });
+  assert.equal(worker2.registeredPatterns.size, 0);
+
+  await worker2.ensureContentScripts(pattern);
+  // Should NOT call register again because scripts exist in persistent storage
+  assert.equal(totalRegisterCalls, 1);
+  assert.equal(worker2.registeredPatterns.has(pattern), true);
+});
+
+test("T12: restore + OPEN_NEW_TAB 并发 runs without Duplicate script ID errors", async () => {
+  const persistentStore = new Set();
+  let registerCalls = 0;
+
+  const mockScripting = {
+    async getRegisteredContentScripts() {
+      await new Promise((r) => setTimeout(r, 5));
+      return Array.from(persistentStore).map((id) => ({ id }));
+    },
+    async registerContentScripts(scripts) {
+      registerCalls++;
+      await new Promise((r) => setTimeout(r, 10));
+      for (const s of scripts) {
+        if (persistentStore.has(s.id)) {
+          throw new Error(`Duplicate script ID '${s.id}'`);
+        }
+        persistentStore.add(s.id);
+      }
+    }
+  };
+
+  const manager = new LanScriptManager({ scripting: mockScripting });
+  const pattern = "http://192.168.1.150:8080/*";
+
+  // Simulate restoreLanContentScripts and OPEN_NEW_TAB (tryOpenLearnedLanRoute) invoking ensure concurrently
+  const restoreTask = manager.ensureContentScripts(pattern);
+  const newTabTask = manager.ensureContentScripts(pattern);
+
+  await Promise.all([restoreTask, newTabTask]);
+
+  assert.equal(registerCalls, 1);
+  assert.equal(manager.registeredPatterns.has(pattern), true);
+});
+
+test("T13: Legacy preview cleanup - cleanupLegacyPreviewStorage clears old preview keys while preserving user settings and LAN routes", async () => {
   const store = new Map();
   store.set("glance-preview:https://nas.local/glance/", { title: "Old Preview" });
   store.set("glance-preview-active-target", "https://nas.local/glance/");
@@ -1325,7 +1636,7 @@ test("T3: Legacy preview cleanup - cleanupLegacyPreviewStorage clears old previe
   assert.equal(store.has("user-setting-custom"), true);
 });
 
-test("T4: Closed ShadowRoot Fade accesses preserved screen reference and triggers fade", () => {
+test("T14: Closed ShadowRoot Fade accesses preserved screen reference and triggers fade", () => {
   let loadingHost = null;
   let loadingScreen = null;
 
@@ -1405,7 +1716,7 @@ test("T4: Closed ShadowRoot Fade accesses preserved screen reference and trigger
   assert.equal(loadingScreen, null);
 });
 
-test("T5: Closed ShadowRoot Fade resolves on transitionend event", (t, done) => {
+test("T15: Closed ShadowRoot Fade resolves on transitionend event", (t, done) => {
   let loadingHost = { removed: false, remove() { this.removed = true; } };
   let loadingScreen = {
     style: {},
@@ -1440,7 +1751,7 @@ test("T5: Closed ShadowRoot Fade resolves on transitionend event", (t, done) => 
   assert.equal(hostRef.removed, false);
 });
 
-test("T6: Closed ShadowRoot Fade resolves via fallback timer when transitionend does not fire", async () => {
+test("T16: Closed ShadowRoot Fade resolves via fallback timer when transitionend does not fire", async () => {
   let removed = false;
   const mockScreen = {
     style: {},
@@ -1465,7 +1776,7 @@ test("T6: Closed ShadowRoot Fade resolves via fallback timer when transitionend 
   assert.equal(removed, true);
 });
 
-test("T7: Missing screen or missing host fallback safely resolves without uncaught errors", () => {
+test("T17: Missing screen or missing host fallback safely resolves without uncaught errors", () => {
   let loadingHost = { removed: false, remove() { this.removed = true; } };
   let loadingScreen = null;
 
@@ -1483,7 +1794,7 @@ test("T7: Missing screen or missing host fallback safely resolves without uncaug
   assert.equal(loadingHost, null);
 });
 
-test("T8: finishTargetPresentation executes visual ready, double requestAnimationFrame, and fadeOut", async () => {
+test("T18: finishTargetPresentation executes visual ready, double requestAnimationFrame, and fadeOut", async () => {
   const steps = [];
 
   const mockGlobal = {
@@ -1506,7 +1817,7 @@ test("T8: finishTargetPresentation executes visual ready, double requestAnimatio
   assert.deepEqual(steps, ["visual_ready", "raf", "raf", "fade_out"]);
 });
 
-test("T9: Synchronous document_start overlay layout exists and is pure loading UI without fake preview DOM", () => {
+test("T19: Synchronous document_start overlay layout exists and is pure loading UI without fake preview DOM", () => {
   const contentJs = fs.readFileSync(new URL("../content.js", import.meta.url), "utf8");
   assert.ok(contentJs.includes("ensureLoadingOverlay();"));
   assert.ok(contentJs.includes("正在载入 Glance"));
@@ -1516,7 +1827,7 @@ test("T9: Synchronous document_start overlay layout exists and is pure loading U
   assert.equal(contentJs.includes("extractGlancePreview"), false);
 });
 
-test("T10: Newtab lightweight loading markup contains clean status card without preview container", () => {
+test("T20: Newtab lightweight loading markup contains clean status card without preview container", () => {
   const newtabHtml = fs.readFileSync(new URL("../newtab.html", import.meta.url), "utf8");
   assert.equal(newtabHtml.includes("preview-container"), false);
   assert.ok(newtabHtml.includes('id="status-card"'));

@@ -19,6 +19,7 @@ import {
   isConfiguredRootOrigin,
   isConfiguredTargetPage,
   LanRouteStore,
+  LanScriptManager,
   MAX_DOCKER_RECOVERY_ATTEMPTS,
   NavigationPersistence,
   normalizeNavigableUrl,
@@ -45,9 +46,11 @@ const tabNavigations = new TabNavigationManager();
 const navPersistence = new NavigationPersistence();
 const lanRouteStore = new LanRouteStore(tabNavigations);
 const ownedTabController = new OwnedTabController(tabNavigations, navPersistence);
-const registeredScriptPatterns = new Set();
+const lanScriptManager = new LanScriptManager();
 
-void restoreLanContentScripts();
+void restoreLanContentScripts().catch((error) => {
+  console.error("Failed to restore LAN content scripts on startup:", error);
+});
 
 function routeKey(targetUrl) {
   return normalizeNavigableUrl(targetUrl);
@@ -88,44 +91,8 @@ async function activeLanDiscoveries() {
   return navPersistence.listActiveDiscoveries();
 }
 
-function scriptIdForPattern(pattern, suffix) {
-  let hash = 2166136261;
-  for (const character of pattern) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `fnos-lan-${(hash >>> 0).toString(16)}-${suffix}`;
-}
-
 async function ensureLanContentScripts(pattern) {
-  if (registeredScriptPatterns.has(pattern)) {
-    return;
-  }
-  const registrations = [
-    {
-      id: scriptIdForPattern(pattern, "page"),
-      matches: [pattern],
-      js: ["page-probe.js"],
-      runAt: "document_start",
-      world: "MAIN",
-      persistAcrossSessions: true
-    },
-    {
-      id: scriptIdForPattern(pattern, "content"),
-      matches: [pattern],
-      js: ["content.js"],
-      runAt: "document_start",
-      persistAcrossSessions: true
-    }
-  ];
-  const existing = new Set(
-    (await chrome.scripting.getRegisteredContentScripts()).map((entry) => entry.id)
-  );
-  const missing = registrations.filter((entry) => !existing.has(entry.id));
-  if (missing.length) {
-    await chrome.scripting.registerContentScripts(missing);
-  }
-  registeredScriptPatterns.add(pattern);
+  return lanScriptManager.ensureContentScripts(pattern);
 }
 
 async function restoreLanContentScripts() {
@@ -635,7 +602,9 @@ async function tryOpenLearnedLanRoute(tabId, settings, navigationId) {
     return null;
   }
 
-  void ensureLanContentScripts(pattern);
+  void ensureLanContentScripts(pattern).catch((error) => {
+    console.error("Failed to ensure LAN content scripts in fast path:", error);
+  });
 
   if (!tabNavigations.isActive(tabId, navigationId)) {
     return null;
@@ -1578,11 +1547,19 @@ async function handleMessage(message, sender) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void ensureInstalledDefaults(true).then(() => restoreLanContentScripts());
+  void ensureInstalledDefaults(true)
+    .then(() => restoreLanContentScripts())
+    .catch((error) => {
+      console.error("Failed to restore LAN content scripts on install:", error);
+    });
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void ensureInstalledDefaults(false).then(() => restoreLanContentScripts());
+  void ensureInstalledDefaults(false)
+    .then(() => restoreLanContentScripts())
+    .catch((error) => {
+      console.error("Failed to restore LAN content scripts on startup:", error);
+    });
 });
 
 chrome.action.onClicked.addListener(() => {

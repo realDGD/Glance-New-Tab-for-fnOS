@@ -1436,3 +1436,103 @@ export async function cleanupLegacyPreviewStorage(storageArea) {
     // Ignore
   }
 }
+
+export function scriptIdForPattern(pattern, suffix) {
+  let hash = 2166136261;
+  const str = String(pattern || "").trim();
+  for (const character of str) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnos-lan-${(hash >>> 0).toString(16)}-${suffix}`;
+}
+
+export function isDuplicateScriptRegistrationError(error) {
+  if (!error) return false;
+  const msg = typeof error === "string" ? error : error?.message || "";
+  return /duplicate\s+script\s+id/i.test(msg);
+}
+
+export class LanScriptManager {
+  constructor({ scripting = null } = {}) {
+    this.scripting = scripting;
+    this.registeredPatterns = new Set();
+    this.ensurePromises = new Map();
+  }
+
+  getScripting() {
+    return this.scripting || globalThis.chrome?.scripting;
+  }
+
+  async ensureContentScripts(pattern) {
+    if (!pattern || typeof pattern !== "string") {
+      return;
+    }
+    const key = pattern.trim();
+    if (this.registeredPatterns.has(key)) {
+      return;
+    }
+    const inflight = this.ensurePromises.get(key);
+    if (inflight) {
+      return inflight;
+    }
+    const task = this._executeEnsure(key);
+    this.ensurePromises.set(key, task);
+    try {
+      await task;
+    } finally {
+      this.ensurePromises.delete(key);
+    }
+  }
+
+  async _executeEnsure(pattern) {
+    const scripting = this.getScripting();
+    if (!scripting || typeof scripting.getRegisteredContentScripts !== "function") {
+      return;
+    }
+
+    const registrations = [
+      {
+        id: scriptIdForPattern(pattern, "page"),
+        matches: [pattern],
+        js: ["page-probe.js"],
+        runAt: "document_start",
+        world: "MAIN",
+        persistAcrossSessions: true
+      },
+      {
+        id: scriptIdForPattern(pattern, "content"),
+        matches: [pattern],
+        js: ["content.js"],
+        runAt: "document_start",
+        persistAcrossSessions: true
+      }
+    ];
+
+    const existing = new Set(
+      (await scripting.getRegisteredContentScripts()).map((entry) => entry.id)
+    );
+    const missing = registrations.filter((entry) => !existing.has(entry.id));
+
+    if (missing.length > 0) {
+      try {
+        await scripting.registerContentScripts(missing);
+      } catch (error) {
+        if (isDuplicateScriptRegistrationError(error)) {
+          const refreshed = new Set(
+            (await scripting.getRegisteredContentScripts()).map((entry) => entry.id)
+          );
+          const stillMissing = registrations.some((entry) => !refreshed.has(entry.id));
+          if (!stillMissing) {
+            this.registeredPatterns.add(pattern);
+            return;
+          }
+        }
+        throw error;
+      }
+    }
+
+    this.registeredPatterns.add(pattern);
+  }
+}
+
