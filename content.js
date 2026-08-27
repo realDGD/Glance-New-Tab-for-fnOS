@@ -597,6 +597,11 @@
     }
     probeUrl.searchParams.set("__keep_fnnas_probe", String(Date.now()));
 
+    const existing = document.getElementById("keep-fnnas-login-docker-probe");
+    if (existing) {
+      return existing;
+    }
+
     const frame = document.createElement("iframe");
     frame.id = "keep-fnnas-login-docker-probe";
     frame.src = probeUrl.href;
@@ -612,7 +617,24 @@
       "pointer-events:none",
       "border:0"
     ].join(";");
-    document.documentElement.append(frame);
+
+    const attach = () => {
+      const container = document.documentElement || document.body;
+      if (container && !document.getElementById("keep-fnnas-login-docker-probe")) {
+        container.append(frame);
+        return true;
+      }
+      return false;
+    };
+
+    if (!attach()) {
+      const observer = new MutationObserver(() => {
+        if (attach()) {
+          observer.disconnect();
+        }
+      });
+      observer.observe(document, { childList: true });
+    }
     return frame;
   }
 
@@ -695,17 +717,6 @@
       return;
     }
 
-    setLoading("正在检查并恢复 fnOS 登录状态…", settings);
-    await waitForDocument();
-    await new Promise((resolve) => window.setTimeout(resolve, PAGE_SETTLE_MS));
-
-    const initialFailure = pageAuthenticationFailure();
-    if (initialFailure) {
-      setLoading(authenticationFailureMessage(initialFailure), settings);
-      await send({ type: "AUTH_INVALID", reason: initialFailure });
-      return;
-    }
-
     const dockerRecovery = isDockerRecovery(pending);
     if (dockerRecovery && pending.phase === "bootstrap") {
       if (isFnConnectBootstrapPage(pending.bootstrapUrl)) {
@@ -780,6 +791,12 @@
       frameReadyAt: 0
     };
 
+    console.debug(`[FNOS timing] content_document_start +${Date.now() - timing.rootEnteredAt}ms`);
+    if (dockerProbeFrame) {
+      console.debug(`[FNOS timing] frame_probe_started +${Date.now() - timing.rootEnteredAt}ms`);
+    }
+    console.debug(`[FNOS timing] background_probe_started +${Date.now() - timing.rootEnteredAt}ms`);
+
     if (document.readyState !== "complete") {
       window.addEventListener("load", () => {
         console.debug(
@@ -787,6 +804,43 @@
         );
       }, { once: true });
     }
+
+    // Parallel DOM diagnostics:
+    let domDiagnosticsVerdict = null; // null: pending, "clean": clean, "error": error
+    let domDiagnosticsFailureReason = null;
+
+    const runDomDiagnostics = async () => {
+      await waitForDocument();
+      console.debug(`[FNOS timing] dom_ready +${Date.now() - timing.rootEnteredAt}ms`);
+      if (stopped) return;
+
+      const initialFailure = pageAuthenticationFailure();
+      const hasLogin = pageContainsLoginForm();
+      console.debug(
+        `[FNOS timing] dom_diagnostics_done +${Date.now() - timing.rootEnteredAt}ms | failure=${initialFailure || "none"} login=${hasLogin}`
+      );
+
+      if (initialFailure) {
+        domDiagnosticsVerdict = "error";
+        domDiagnosticsFailureReason = initialFailure;
+        setLoading(authenticationFailureMessage(initialFailure), settings);
+        cleanupProbeResources();
+        stopped = true;
+        await send({ type: "AUTH_INVALID", reason: initialFailure });
+        return;
+      }
+
+      if (hasLogin) {
+        domDiagnosticsVerdict = "error";
+        domDiagnosticsFailureReason = "login-form";
+        showManualLogin("请在 fnOS 官方页面完成登录，成功后将自动打开主页。");
+        return;
+      }
+
+      domDiagnosticsVerdict = "clean";
+    };
+
+    const domDiagnosticsPromise = runDomDiagnostics();
 
     function handleRuntimeMessage(message) {
       if (stopped) {
@@ -811,7 +865,8 @@
         window.clearTimeout(fallbackTimer);
         fallbackTimer = null;
       }
-      dockerProbeFrame?.remove();
+      const probeFrame = document.getElementById("keep-fnnas-login-docker-probe");
+      probeFrame?.remove();
     }
 
     function showManualLogin(message, showRetry = false) {
@@ -828,8 +883,11 @@
       if (dockerRecovery && dockerFallbackRequested) {
         return;
       }
-      if (pageContainsLoginForm()) {
-        showManualLogin("请在 fnOS 官方页面完成登录，成功后将自动打开主页。");
+
+      if (domDiagnosticsVerdict === null) {
+        await domDiagnosticsPromise;
+      }
+      if (stopped || domDiagnosticsVerdict === "error") {
         return;
       }
 
@@ -888,9 +946,11 @@
 
       if (!timing.backgroundReadyAt && backgroundReady) {
         timing.backgroundReadyAt = now;
+        console.debug(`[FNOS timing] background_ready +${now - timing.rootEnteredAt}ms`);
       }
       if (!timing.frameReadyAt && frameReady) {
         timing.frameReadyAt = now;
+        console.debug(`[FNOS timing] frame_ready +${now - timing.rootEnteredAt}ms`);
       }
 
       // Level 1: Confirmed Ready (strongReady is true, or native fnOS result.ok)
@@ -943,10 +1003,18 @@
         if (navigationRequested) {
           return;
         }
+
+        if (domDiagnosticsVerdict === null) {
+          await domDiagnosticsPromise;
+        }
+        if (stopped || domDiagnosticsVerdict === "error") {
+          return;
+        }
+
         navigationRequested = true;
         setLoading("fnOS 登录已恢复，正在打开 Glance…", settings);
         console.debug(
-          `[FNOS timing] root commit +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready +${timing.frameReadyAt ? timing.frameReadyAt - timing.rootEnteredAt : "none"}ms | confirmed target +${now - timing.rootEnteredAt}ms`
+          `[FNOS timing] target_navigation (confirmed) +${now - timing.rootEnteredAt}ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready +${timing.frameReadyAt ? timing.frameReadyAt - timing.rootEnteredAt : "none"}ms`
         );
         const response = await send({
           type: "AUTH_READY",
@@ -968,10 +1036,18 @@
           if (navigationRequested) {
             return;
           }
+
+          if (domDiagnosticsVerdict === null) {
+            await domDiagnosticsPromise;
+          }
+          if (stopped || domDiagnosticsVerdict === "error") {
+            return;
+          }
+
           navigationRequested = true;
           setLoading("fnOS 登录已恢复，正在快速打开 Glance…", settings);
           console.debug(
-            `[FNOS timing] root commit +0ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready pending | optimistic target +${now - timing.rootEnteredAt}ms`
+            `[FNOS timing] target_navigation (optimistic) +${now - timing.rootEnteredAt}ms | background ready +${Math.max(0, (timing.backgroundReadyAt || now) - timing.rootEnteredAt)}ms | frame ready pending`
           );
           const response = await send({
             type: "AUTH_READY",
@@ -1022,8 +1098,7 @@
         return;
       }
 
-      if (pageContainsLoginForm()) {
-        showManualLogin("请在 fnOS 官方页面完成登录，成功后将自动打开主页。");
+      if (domDiagnosticsVerdict === "error") {
         return;
       }
 

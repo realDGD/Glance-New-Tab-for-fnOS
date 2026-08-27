@@ -743,6 +743,7 @@ async function navigateToTarget(tabId, pending, reason, explicitNavigationId = n
     lastAttemptAt: Date.now()
   };
   await setPending(tabId, updated, navigationId);
+  console.debug?.(`[FNOS timing] target_navigation tab ${tabId} nav ${navigationId} reason ${reason}`);
   await navigateOwnedTab(tabId, navigationId, updated.targetUrl);
   return { action: "navigating" };
 }
@@ -1253,6 +1254,7 @@ async function handleBootstrapUrlCommit(tabId, tabUrl) {
 
     const isRoot = isConfiguredRootOrigin(pending, tabUrl);
     if (isRoot) {
+      console.debug?.(`[FNOS timing] root_url_commit tab ${tabId} nav ${navContext.navigationId}`);
       await completeDockerBootstrap(tabId, tabUrl, false, navContext.navigationId);
       return;
     }

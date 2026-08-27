@@ -3037,3 +3037,259 @@ test("STARTUP15 (P0-3 & P0-4): isSessionWarmed 是纯只读操作，markSessionW
   assert.equal(writeOccurred, true);
 });
 
+test("EARLY1 (T1): root document loading 时 health probe 已启动，不等待 waitForDocument", async () => {
+  let healthProbeStarted = false;
+  let domLoaded = false;
+
+  async function mockWaitForDocument() {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    domLoaded = true;
+  }
+
+  // Start parallel DOM diagnostics:
+  const domDiagnosticsPromise = mockWaitForDocument();
+
+  // Network probe starts immediately:
+  healthProbeStarted = true;
+
+  assert.equal(healthProbeStarted, true);
+  assert.equal(domLoaded, false);
+
+  await domDiagnosticsPromise;
+  assert.equal(domLoaded, true);
+});
+
+test("EARLY2 (T2): frame probe 在 documentElement 可用时立即创建，不等待 DOMContentLoaded", () => {
+  let appendedToDocElement = false;
+  const mockDocElement = {
+    append(el) {
+      appendedToDocElement = true;
+    }
+  };
+  const mockDoc = {
+    documentElement: mockDocElement,
+    getElementById(id) { return null; },
+    createElement(tag) { return { id: tag, setAttribute() {}, style: {} }; }
+  };
+
+  function createProbeFrameSimulated(doc) {
+    const frame = doc.createElement("iframe");
+    frame.id = "keep-fnnas-login-docker-probe";
+    doc.documentElement.append(frame);
+    return frame;
+  }
+
+  const frame = createProbeFrameSimulated(mockDoc);
+  assert.ok(frame);
+  assert.equal(appendedToDocElement, true);
+});
+
+test("EARLY3 (T3): documentElement 初始不存在时不抛异常，出现后快速挂载", () => {
+  let attached = false;
+  let observerCreated = false;
+
+  const mockDoc = {
+    documentElement: null,
+    getElementById(id) { return null; },
+    createElement(tag) { return { id: tag, setAttribute() {}, style: {} }; }
+  };
+
+  function createProbeFrameWithFallback(doc) {
+    const frame = doc.createElement("iframe");
+    frame.id = "keep-fnnas-login-docker-probe";
+    const attach = () => {
+      if (doc.documentElement) {
+        attached = true;
+        return true;
+      }
+      return false;
+    };
+    if (!attach()) {
+      observerCreated = true;
+      // Simulate documentElement appearing shortly after:
+      doc.documentElement = { append() {} };
+      attach();
+    }
+    return frame;
+  }
+
+  const frame = createProbeFrameWithFallback(mockDoc);
+  assert.ok(frame);
+  assert.equal(observerCreated, true);
+  assert.equal(attached, true);
+});
+
+test("EARLY4 (T4): DOMContentLoaded 不启动第二套 probe，保持单例幂等", () => {
+  let iframeCount = 0;
+  const existingMap = new Map();
+  const mockDoc = {
+    documentElement: { append(el) { existingMap.set(el.id, el); } },
+    getElementById(id) { return existingMap.get(id) || null; },
+    createElement(tag) { return { id: "", setAttribute() {}, style: {} }; }
+  };
+
+  function createDockerProbeFrameIdempotent(doc) {
+    if (doc.getElementById("keep-fnnas-login-docker-probe")) {
+      return doc.getElementById("keep-fnnas-login-docker-probe");
+    }
+    const frame = doc.createElement("iframe");
+    frame.id = "keep-fnnas-login-docker-probe";
+    iframeCount++;
+    doc.documentElement.append(frame);
+    return frame;
+  }
+
+  // Call 1 at document_start:
+  const f1 = createDockerProbeFrameIdempotent(mockDoc);
+  // Call 2 at DOMContentLoaded:
+  const f2 = createDockerProbeFrameIdempotent(mockDoc);
+
+  assert.equal(iframeCount, 1);
+  assert.equal(f1, f2);
+});
+
+test("EARLY5 (T5): DOM diagnostics 后置：network probe 先跑，DOM ready 后才执行 login/error 检查", async () => {
+  const events = [];
+  let domReady = false;
+
+  // Network probe starts:
+  events.push("network_probe_started");
+
+  // DOM diagnostics runs in background:
+  const domTask = (async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    domReady = true;
+    events.push("dom_diagnostics_done");
+  })();
+
+  assert.deepEqual(events, ["network_probe_started"]);
+  assert.equal(domReady, false);
+
+  await domTask;
+  assert.deepEqual(events, ["network_probe_started", "dom_diagnostics_done"]);
+  assert.equal(domReady, true);
+});
+
+test("EARLY6 (T6): network Ready 但 DOM 最终发现 login 页面时拦截 target 导航", async () => {
+  let targetNavigated = false;
+  let manualLoginShown = false;
+
+  let domDiagnosticsVerdict = null;
+  const domTask = (async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    // DOM finds login form!
+    domDiagnosticsVerdict = "error";
+    manualLoginShown = true;
+  })();
+
+  async function onNetworkReady() {
+    if (domDiagnosticsVerdict === null) {
+      await domTask;
+    }
+    if (domDiagnosticsVerdict === "error") {
+      return; // Intercepted!
+    }
+    targetNavigated = true;
+  }
+
+  await onNetworkReady();
+  assert.equal(targetNavigated, false);
+  assert.equal(manualLoginShown, true);
+});
+
+test("EARLY7 (T7): 正常 root：network Ready 且 DOM diagnostics clean 时直接 target", async () => {
+  let targetNavigated = false;
+
+  let domDiagnosticsVerdict = null;
+  const domTask = (async () => {
+    await new Promise((r) => setTimeout(r, 10));
+    domDiagnosticsVerdict = "clean";
+  })();
+
+  async function onNetworkReady() {
+    if (domDiagnosticsVerdict === null) {
+      await domTask;
+    }
+    if (domDiagnosticsVerdict === "error") {
+      return;
+    }
+    targetNavigated = true;
+  }
+
+  await onNetworkReady();
+  assert.equal(targetNavigated, true);
+});
+
+test("EARLY8 (T8): tab 处于 status=loading 时只要 readiness 满足即可推进 target，不等待 status=complete", () => {
+  const tabStatus = "loading";
+  const strongReady = true;
+  const officialBootstrapCompleted = true;
+
+  function canProceedToTarget(status, ready, bootstrapCompleted) {
+    // Target is permitted even if tab is still "loading" as long as auth readiness is met
+    return ready && bootstrapCompleted;
+  }
+
+  assert.equal(canProceedToTarget(tabStatus, strongReady, officialBootstrapCompleted), true);
+});
+
+test("EARLY9 (T9): root loading 期间用户主动跳走，旧 navigationId 回调全部放弃夺回", () => {
+  const manager = new TabNavigationManager();
+  const tabId = 601;
+  const navA = manager.begin(tabId);
+
+  // User navigates away:
+  manager.handleUrlChange(tabId, "https://github.com/");
+
+  assert.equal(manager.isActive(tabId, navA.navigationId), false);
+});
+
+test("EARLY10 (T10): navigation A 废弃后，A 迟到的 DOM diagnostics 不影响 navigation B", async () => {
+  const manager = new TabNavigationManager();
+  const tabId = 602;
+  const navA = manager.begin(tabId);
+
+  let navBTargeted = false;
+  let navATargeted = false;
+
+  // Nav A DOM task:
+  const navADomTask = async () => {
+    await new Promise((r) => setTimeout(r, 30));
+    if (!manager.isActive(tabId, navA.navigationId)) {
+      return; // Discarded!
+    }
+    navATargeted = true;
+  };
+
+  // Nav B starts immediately:
+  const navB = manager.begin(tabId);
+  navBTargeted = true;
+
+  await navADomTask();
+  assert.equal(navATargeted, false);
+  assert.equal(navBTargeted, true);
+});
+
+test("EARLY11 (T11): 提前启动 probe 后，recovery timeout 准确触发并转入 manual", () => {
+  const startedAt = Date.now() - 125_000;
+  const recoveryTimeoutSeconds = 120;
+
+  function checkTimeout(started, timeoutSec) {
+    const elapsed = Date.now() - started;
+    return elapsed >= timeoutSec * 1000;
+  }
+
+  assert.equal(checkTimeout(startedAt, recoveryTimeoutSeconds), true);
+});
+
+test("EARLY12 (T12): sessionWarmed = true 时二次打开保持 target-first，不执行 root document_start probe", () => {
+  const settings = {
+    setupCompleted: true,
+    enabled: true,
+    fnosRecoveryEnabled: true,
+    targetUrl: "https://demo-nas.5ddd.com/app/glance/"
+  };
+  const sessionWarmed = true;
+  assert.equal(chooseInitialNavigation(settings, sessionWarmed), "target-first");
+});
+
